@@ -20,6 +20,7 @@ extern "C" {
 #include "ctrl/ctrl2080/ctrl2080perf.h"
 #include "ctrl/ctrl2080/ctrl2080thermal.h"
 #include "ctrl/ctrl2080/ctrl2080bus.h"
+#include "ctrl/ctrl2080/ctrl2080fb.h"
 #include "ctrl/ctrl2080/ctrl2080gpu.h"
 #include "class/cl00de.h"
 
@@ -615,8 +616,48 @@ static void telReadLevels(NvrmTelemetryState *state, struct NVRMTelemetry *out)
     logged = true;
 }
 
-extern "C" bool nvrm_query_telemetry(unsigned int gpuId, void **opaque, struct NVRMTelemetry *out)
+// Framebuffer occupancy. The shared block does not carry it, so this is a control call:
+// FB_GET_INFO_V2 answers inline with a list of (index, value) pairs, all in kilobytes.
+// used = heap - free (every user allocation the RM tracks); total prefers TOTAL_RAM_SIZE
+// (the whole 8 GB, matching what the box label says) and falls back to the heap size.
+// The params struct is ~KB of stack with the full list, so it is static, like the clock
+// table's -- the telemetry poll is a single serialized timer path.
+static void telReadVram(NvrmTelemetryState *state, struct NVRMTelemetry *out)
 {
+    static NV2080_CTRL_FB_GET_INFO_V2_PARAMS fb;
+    static bool logged = false;
+
+    fbiZero(&fb, sizeof(fb));
+    enum { kIdxTotalRam = 0, kIdxHeapSize = 1, kIdxHeapFree = 2, kIdxCount = 3 };
+    fb.fbInfoListSize = kIdxCount;
+    fb.fbInfoList[kIdxTotalRam].index = NV2080_CTRL_FB_INFO_INDEX_TOTAL_RAM_SIZE; // 0x08
+    fb.fbInfoList[kIdxHeapSize].index = NV2080_CTRL_FB_INFO_INDEX_HEAP_SIZE;      // 0x09
+    fb.fbInfoList[kIdxHeapFree].index = NV2080_CTRL_FB_INFO_INDEX_HEAP_FREE;      // 0x16
+
+    const NvV32 st = fbiControl(state->hClient, state->hSub, NV2080_CTRL_CMD_FB_GET_INFO_V2,
+                                &fb, sizeof(fb));
+    if (!logged) {
+        logged = true;
+        FBILOG("vram: FB_GET_INFO_V2 -> status 0x%x, total %u KB, heap %u KB, free %u KB",
+               (unsigned)st, (unsigned)fb.fbInfoList[kIdxTotalRam].data,
+               (unsigned)fb.fbInfoList[kIdxHeapSize].data,
+               (unsigned)fb.fbInfoList[kIdxHeapFree].data);
+    }
+    if (st != 0) return;
+
+    const unsigned totalKb = fb.fbInfoList[kIdxTotalRam].data;
+    const unsigned heapKb  = fb.fbInfoList[kIdxHeapSize].data;
+    const unsigned freeKb  = fb.fbInfoList[kIdxHeapFree].data;
+    // A heap of zero or a free larger than the heap means the call answered garbage;
+    // keep the flag clear rather than publish nonsense.
+    if (!heapKb || freeKb > heapKb) return;
+
+    out->vramUsedBytes  = (unsigned long long)(heapKb - freeKb) * 1024u;
+    out->vramTotalBytes = (unsigned long long)(totalKb ? totalKb : heapKb) * 1024u;
+    if (out->vramUsedBytes) out->valid |= NVRM_TELEMETRY_VALID_VRAM;
+}
+
+extern "C" bool nvrm_query_telemetry(unsigned int gpuId, void **opaque, struct NVRMTelemetry *out){
     if (!opaque || !out) return false;
     fbiZero(out, sizeof(*out));
     out->version = NVRM_TELEMETRY_ABI_VERSION;
@@ -792,6 +833,7 @@ extern "C" bool nvrm_query_telemetry(unsigned int gpuId, void **opaque, struct N
     // above.
     telReadPcie(state, out);
     telReadLevels(state, out);
+    telReadVram(state, out);
 
     out->timestamp = mach_continuous_time();
     return out->valid != 0;

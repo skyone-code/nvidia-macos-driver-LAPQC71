@@ -1242,6 +1242,8 @@ public:
             "GPU ECC Corrected Volatile", "GPU ECC Corrected Aggregate",
             "GPU ECC Uncorrected Volatile", "GPU ECC Uncorrected Aggregate",
             "GPU Row Remap Correctable", "GPU Row Remap Uncorrectable", "GPU Row Remap Pending",
+            // v3: framebuffer occupancy, in bytes (64-bit -- an 8 GB card overflows 32).
+            "GPU VRAM Used(Bytes)", "GPU VRAM Total(Bytes)",
         };
         for (unsigned i = 0; i < sizeof kKeys / sizeof kKeys[0]; i++) d->removeObject(kKeys[i]);
         // The clock table's keys carry the profile number, so they are formatted rather
@@ -1375,6 +1377,20 @@ public:
                 pubProfile(d, p, "Memory(MHz)",         l.memoryMhz);
                 pubProfile(d, p, "Memory Min(MHz)",     l.memoryMinMhz);
                 pubProfile(d, p, "Memory Max(MHz)",     l.memoryMaxMhz);
+            }
+        }
+
+        // ---- v3 -------------------------------------------------------------------
+        // Framebuffer occupancy in bytes. 64-bit numbers: an 8 GB card does not fit
+        // in 32 bits, so this bypasses the 32-bit pubNum helper.
+        if (t.valid & NVRM_TELEMETRY_VALID_VRAM) {
+            if (t.vramUsedBytes) {
+                OSNumber *n = OSNumber::withNumber(t.vramUsedBytes, 64);
+                if (n) { d->setObject("GPU VRAM Used(Bytes)", n); n->release(); }
+            }
+            if (t.vramTotalBytes) {
+                OSNumber *n = OSNumber::withNumber(t.vramTotalBytes, 64);
+                if (n) { d->setObject("GPU VRAM Total(Bytes)", n); n->release(); }
             }
         }
     }

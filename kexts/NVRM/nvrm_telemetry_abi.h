@@ -49,7 +49,11 @@
 // firmware keeps beside the clocks, and the per-profile clock table. Everything new is
 // appended, so a reader built against 1 that only looks at its own prefix still works;
 // the version is bumped because the structure it copies is now larger.
-#define NVRM_TELEMETRY_ABI_VERSION 2u
+//
+// 3 added the framebuffer occupancy (vramUsedBytes / vramTotalBytes, from
+// NV2080_CTRL_CMD_FB_GET_INFO_V2) so a monitor can show how much of the 8 GB is
+// actually allocated without guessing from the utilization percentage.
+#define NVRM_TELEMETRY_ABI_VERSION 3u
 #define NVRM_TELEMETRY_FN "NVRMGpuTelemetry"
 
 // The clock table: NV2080_CTRL_PERF_GET_LEVEL_INFO_V2 answers for three profiles
@@ -168,6 +172,15 @@ struct NVRMTelemetry {
     unsigned int levelCount;
     struct NVRMTelemetryLevel levels[NVRM_TELEMETRY_MAX_LEVELS];
 
+    // ---- v3 ---------------------------------------------------------------------
+    //
+    // Framebuffer occupancy, in bytes, from NV2080_CTRL_CMD_FB_GET_INFO_V2. "used" is
+    // the heap minus what is still free (every user allocation the RM tracks), "total"
+    // is the whole video memory the board reports (8 GB on this part, not the slightly
+    // smaller user heap). A monitor wants both: the pair reads like iGPU's
+    // "in use / capacity" line, and a leak shows up as used creeping toward total.
+    unsigned long long vramUsedBytes, vramTotalBytes;
+
     unsigned long long timestamp;  // nanoseconds, from the kernel's continuous clock
 };
 
@@ -187,6 +200,8 @@ struct NVRMTelemetry {
 #define NVRM_TELEMETRY_VALID_ECC          0x00001000u
 #define NVRM_TELEMETRY_VALID_ROW_REMAP    0x00002000u
 #define NVRM_TELEMETRY_VALID_LEVELS       0x00004000u
+// v3
+#define NVRM_TELEMETRY_VALID_VRAM         0x00008000u
 
 // RUSD_CLK_THROTTLE_REASON_*, repeated here so user space needs no RM headers.
 #define NVRM_TELEMETRY_THROTTLE_GPU_IDLE                 0x00000001u
