@@ -66,6 +66,7 @@ static bool nvaccel_verbose() { static int v = -1; if (v < 0) { int x = 0; v = P
 #define ALOGV(fmt, ...) do { if (nvaccel_verbose()) ALOG(fmt, ##__VA_ARGS__); } while (0)
 #include <libkern/c++/OSSymbol.h>
 #include "nvrm_vram_abi.h"
+#include "nvrm_telemetry_abi.h"
 #include <IOKit/IODeviceMemory.h>
 #include "tahoe_fwd.h"   // macOS 26: inherited slots Apple no longer exports, forwarded through its vtables
 #include "nvaccel_stubs.h"
@@ -344,6 +345,10 @@ public:
     NVRMUtilization     fUtil = {};
     uint64_t            fUtilUpdated = 0;
     bool                fUtilValid = false;
+    // Sensors and clocks: the same provider and the same lock, a separate query.
+    NVRMTelemetry       fTel = {};
+    uint64_t            fTelUpdated = 0;
+    bool                fTelValid = false;
     IONotifier *fFBNote = nullptr;
     IONotifier *fIntelNote = nullptr;
     IONotifier *fGopNote = nullptr;     // NMGopFB: an AMD integrated GPU's panel, published as head 4 with the hybrid switch on
@@ -1041,6 +1046,9 @@ public:
     static void utilTimerFired(OSObject *owner, IOTimerEventSource *sender) {
         NVAccel *me = (NVAccel *)owner;
         me->sampleUtilization();
+        // The sensor sweep is a second RM client call, so it runs at the same 1 Hz as the
+        // utilization ring rather than with the 250 ms temperature timer.
+        me->sampleTelemetry();
         sender->setTimeoutMS(kNvUtilIntervalMs);
     }
 
@@ -1088,6 +1096,46 @@ public:
         IOLockUnlock(fUtilLock);
     }
 
+    // The sensors and clocks ride on the same provider and lock as the utilization
+    // sample; only the platform function and the cached structure differ.
+    void sampleTelemetry() {
+        if (fUtilProvider && fUtilProvider->isInactive()) {
+            fUtilProvider->release(); fUtilProvider = nullptr;
+        }
+        if (!fUtilProvider) {
+            OSIterator *clients = fPCI->getClientIterator();
+            if (clients) {
+                while (OSObject *o = clients->getNextObject()) {
+                    IOService *service = OSDynamicCast(IOService, o);
+                    if (service && service->metaCast("NVRM") && !service->isInactive()) {
+                        service->retain(); fUtilProvider = service; break;
+                    }
+                }
+                clients->release();
+            }
+        }
+        NVRMTelemetry sample = {};
+        sample.version = NVRM_TELEMETRY_ABI_VERSION;
+        IOReturn status = kIOReturnNotAttached;
+        if (fUtilProvider && !fUtilProvider->isInactive()) {
+            const OSSymbol *fn = OSSymbol::withCStringNoCopy(NVRM_TELEMETRY_FN);
+            if (fn) {
+                status = fUtilProvider->callPlatformFunction(fn, false, &sample, nullptr, nullptr, nullptr);
+                fn->release();
+            }
+        }
+        IOLockLock(fUtilLock);
+        if (status == kIOReturnSuccess && sample.version == NVRM_TELEMETRY_ABI_VERSION &&
+            sample.timestamp && sample.valid) {
+            fTel = sample;
+            fTelUpdated = mach_continuous_time();
+            fTelValid = true;
+        } else {
+            fTelValid = false;
+        }
+        IOLockUnlock(fUtilLock);
+    }
+
     // Read-copy-modify-write: the family keeps 70-odd keys in this dictionary and replaces it
     // wholesale every 0.25-2 s, so the copy is taken from whatever is in it at this moment.
     void publishStatistics() {
@@ -1126,8 +1174,209 @@ public:
             }
         }
 #endif
+        publishTelemetry(d);
         setProperty("PerformanceStatistics", d);
         d->release();
+    }
+
+    // The thermal sensors and the clocks, under the names the rest of the family and the
+    // sensor utilities already use. A reading that was not obtained is removed rather
+    // than published as zero, so a missing key means "not available", not "0 degrees".
+    static const char *sensorKey(unsigned int target) {
+        switch (target) {
+            case NVRM_TELEMETRY_TARGET_GPU:          return "GPU Core Temperature(C)";
+            case NVRM_TELEMETRY_TARGET_MEMORY:       return "GPU Memory Temperature(C)";
+            case NVRM_TELEMETRY_TARGET_BOARD:        return "GPU Board Temperature(C)";
+            case NVRM_TELEMETRY_TARGET_POWER_SUPPLY: return "GPU Power Supply Temperature(C)";
+            default:                                 return nullptr;
+        }
+    }
+
+    // Two shorthands so the block below reads as a list of readings rather than as forty
+    // repetitions of the same three lines.
+    static void pubNum(OSDictionary *d, const char *key, unsigned long long value) {
+        OSNumber *n = OSNumber::withNumber(value, 32);
+        if (n) { d->setObject(key, n); n->release(); }
+    }
+
+    static void pubProfile(OSDictionary *d, unsigned profile, const char *field, unsigned value) {
+        char key[64];
+        snprintf(key, sizeof key, "GPU Profile %u %s", profile, field);
+        if (value) pubNum(d, key, value);
+    }
+
+    void publishTelemetry(OSDictionary *d) {
+        NVRMTelemetry t = {};
+        bool valid = false;
+        if (fUtilLock) {
+            IOLockLock(fUtilLock);
+            uint64_t age = 0;
+            if (fTelValid) absolutetime_to_nanoseconds(mach_continuous_time() - fTelUpdated, &age);
+            valid = fTelValid && age <= kNvUtilMaxAgeNs;
+            t = fTel;
+            IOLockUnlock(fUtilLock);
+        }
+
+        // Every key this method can publish, so a value that stops being available is
+        // removed instead of left behind from an earlier sample.
+        static const char *const kKeys[] = {
+            "GPU Core Temperature(C)", "GPU Memory Temperature(C)",
+            "GPU Board Temperature(C)", "GPU Power Supply Temperature(C)",
+            "GPU Core Clock(MHz)", "GPU Memory Clock(MHz)",
+            "GPU Video Clock(MHz)", "GPU SM Clock(MHz)",
+            "GPU Core Clock Max(MHz)", "GPU Memory Clock Max(MHz)",
+            "GPU PState",
+            "GPU Power(W)", "GPU Power Limit(W)", "GPU Power GPU(W)", "GPU Power Memory(W)",
+            "GPU Power Instant(W)",
+            "GPU Throttle Mask",
+            // v2: the link, the fan, the engines and the memory's health.
+            "GPU PCIe Generation", "GPU PCIe Width",
+            "GPU PCIe Max Generation", "GPU PCIe Max Width",
+            "GPU PCIe Line Code Errors", "GPU PCIe CRC Errors", "GPU PCIe NAKs",
+            "GPU PCIe L0s Exits", "GPU PCIe Correctable Errors",
+            "GPU PCIe Nonfatal Errors", "GPU PCIe Fatal Errors",
+            "GPU PCIe Unsupported Requests",
+            "GPU Fan RPM", "GPU Fan Count",
+            "GPU Memory Controller Utilization %", "GPU NVENC Utilization %",
+            "GPU NVDEC Utilization %", "GPU NVJPG Utilization %", "GPU NVOFA Utilization %",
+            "GPU ECC Corrected Volatile", "GPU ECC Corrected Aggregate",
+            "GPU ECC Uncorrected Volatile", "GPU ECC Uncorrected Aggregate",
+            "GPU Row Remap Correctable", "GPU Row Remap Uncorrectable", "GPU Row Remap Pending",
+        };
+        for (unsigned i = 0; i < sizeof kKeys / sizeof kKeys[0]; i++) d->removeObject(kKeys[i]);
+        // The clock table's keys carry the profile number, so they are formatted rather
+        // than listed; same cleanup rule.
+        for (unsigned p = 0; p < NVRM_TELEMETRY_MAX_LEVELS; p++) {
+            static const char *const kFields[] = {
+                "Graphics(MHz)", "Graphics Min(MHz)", "Graphics Max(MHz)",
+                "Memory(MHz)", "Memory Min(MHz)", "Memory Max(MHz)",
+            };
+            char key[64];
+            for (unsigned f = 0; f < sizeof kFields / sizeof kFields[0]; f++) {
+                snprintf(key, sizeof key, "GPU Profile %u %s", p, kFields[f]);
+                d->removeObject(key);
+            }
+        }
+
+        if (!valid) return;
+
+        if (t.valid & NVRM_TELEMETRY_VALID_SENSORS) {
+            for (unsigned i = 0; i < t.sensorCount && i < NVRM_TELEMETRY_MAX_SENSORS; i++) {
+                const char *key = sensorKey(t.sensors[i].target);
+                if (!key) continue;
+                // Two sensors can report the same target on some boards; the first is the
+                // one the family has always published, so later ones do not overwrite it.
+                if (d->getObject(key)) continue;
+                OSNumber *n = OSNumber::withNumber((unsigned long long)(long long)t.sensors[i].value, 32);
+                if (n) { d->setObject(key, n); n->release(); }
+            }
+        }
+
+        // Power in watts, rounded from the milliwatts the firmware reports. A part that
+        // does not meter it leaves the flag clear and nothing is published, so a missing
+        // key still means "not available" rather than "draws nothing".
+        if (t.valid & NVRM_TELEMETRY_VALID_POWER) {
+            OSNumber *n = OSNumber::withNumber((unsigned long long)((t.powerMw + 500) / 1000), 32);
+            if (n) { d->setObject("GPU Power(W)", n); n->release(); }
+        }
+        if (t.valid & NVRM_TELEMETRY_VALID_POWER_LIMIT) {
+            OSNumber *n = OSNumber::withNumber((unsigned long long)((t.powerLimitMw + 500) / 1000), 32);
+            if (n) { d->setObject("GPU Power Limit(W)", n); n->release(); }
+        }
+        if (t.gpuPowerMw) {
+            OSNumber *n = OSNumber::withNumber((unsigned long long)((t.gpuPowerMw + 500) / 1000), 32);
+            if (n) { d->setObject("GPU Power GPU(W)", n); n->release(); }
+        }
+        if (t.memoryPowerMw) {
+            OSNumber *n = OSNumber::withNumber((unsigned long long)((t.memoryPowerMw + 500) / 1000), 32);
+            if (n) { d->setObject("GPU Power Memory(W)", n); n->release(); }
+        }
+        if (t.valid & NVRM_TELEMETRY_VALID_THROTTLE) {
+            OSNumber *n = OSNumber::withNumber((unsigned long long)t.throttleMask, 32);
+            if (n) { d->setObject("GPU Throttle Mask", n); n->release(); }
+        }
+
+        if (t.valid & NVRM_TELEMETRY_VALID_CLOCK) {
+            struct { const char *key; unsigned value; } clocks[] = {
+                { "GPU Core Clock(MHz)",        t.clockGraphicsMhz },
+                { "GPU Memory Clock(MHz)",      t.clockMemoryMhz },
+                { "GPU Video Clock(MHz)",       t.clockVideoMhz },
+                { "GPU SM Clock(MHz)",          t.clockSmMhz },
+                { "GPU Core Clock Max(MHz)",    t.clockGraphicsMaxMhz },
+                { "GPU Memory Clock Max(MHz)",  t.clockMemoryMaxMhz },
+            };
+            for (unsigned i = 0; i < sizeof clocks / sizeof clocks[0]; i++) {
+                if (!clocks[i].value) continue;
+                OSNumber *n = OSNumber::withNumber((unsigned long long)clocks[i].value, 32);
+                if (n) { d->setObject(clocks[i].key, n); n->release(); }
+            }
+        }
+
+        if (t.valid & NVRM_TELEMETRY_VALID_PSTATE) {
+            OSNumber *n = OSNumber::withNumber((unsigned long long)t.pstate, 32);
+            if (n) { d->setObject("GPU PState", n); n->release(); }
+        }
+
+        // ---- v2 -------------------------------------------------------------------
+        if (t.valid & NVRM_TELEMETRY_VALID_INST_POWER) pubNum(d, "GPU Power Instant(W)", (t.instPowerMw + 500) / 1000);
+
+        if (t.valid & NVRM_TELEMETRY_VALID_PCIE) {
+            // A width of zero means the register said "undefined", which a real link never
+            // does; publishing it as 0 lanes would read as broken hardware.
+            if (t.pcieMaxGen)   pubNum(d, "GPU PCIe Max Generation", t.pcieMaxGen);
+            if (t.pcieMaxWidth) pubNum(d, "GPU PCIe Max Width", t.pcieMaxWidth);
+            if (t.pcieCurGen)   pubNum(d, "GPU PCIe Generation", t.pcieCurGen);
+            if (t.pcieCurWidth) pubNum(d, "GPU PCIe Width", t.pcieCurWidth);
+        }
+
+        if (t.valid & NVRM_TELEMETRY_VALID_PCIE_ERRORS) {
+            pubNum(d, "GPU PCIe Line Code Errors", t.pcieLinecodeErrors);
+            pubNum(d, "GPU PCIe CRC Errors", t.pcieCrcErrors);
+            pubNum(d, "GPU PCIe NAKs", t.pcieNaks);
+            pubNum(d, "GPU PCIe L0s Exits", t.pcieL0sExits);
+            pubNum(d, "GPU PCIe Correctable Errors", t.pcieCorrectableErrors);
+            pubNum(d, "GPU PCIe Nonfatal Errors", t.pcieNonfatalErrors);
+            pubNum(d, "GPU PCIe Fatal Errors", t.pcieFatalErrors);
+            pubNum(d, "GPU PCIe Unsupported Requests", t.pcieUnsupportedRequests);
+        }
+
+        if (t.valid & NVRM_TELEMETRY_VALID_FAN) {
+            pubNum(d, "GPU Fan RPM", t.fanRpm);
+            pubNum(d, "GPU Fan Count", t.fanCount);
+        }
+
+        if (t.valid & NVRM_TELEMETRY_VALID_RUSD_UTIL) {
+            pubNum(d, "GPU Memory Controller Utilization %", t.utilMemory);
+            pubNum(d, "GPU NVENC Utilization %", t.utilEnc);
+            pubNum(d, "GPU NVDEC Utilization %", t.utilDec);
+            pubNum(d, "GPU NVJPG Utilization %", t.utilJpg);
+            pubNum(d, "GPU NVOFA Utilization %", t.utilOfa);
+        }
+
+        if (t.valid & NVRM_TELEMETRY_VALID_ECC) {
+            pubNum(d, "GPU ECC Corrected Volatile", t.eccCorrectedVolatile);
+            pubNum(d, "GPU ECC Corrected Aggregate", t.eccCorrectedAggregate);
+            pubNum(d, "GPU ECC Uncorrected Volatile", t.eccUncorrectedVolatile);
+            pubNum(d, "GPU ECC Uncorrected Aggregate", t.eccUncorrectedAggregate);
+        }
+
+        if (t.valid & NVRM_TELEMETRY_VALID_ROW_REMAP) {
+            pubNum(d, "GPU Row Remap Correctable", t.rowRemapCorrectable);
+            pubNum(d, "GPU Row Remap Uncorrectable", t.rowRemapUncorrectable);
+            pubNum(d, "GPU Row Remap Pending", t.rowRemapPending);
+        }
+
+        if (t.valid & NVRM_TELEMETRY_VALID_LEVELS) {
+            for (unsigned p = 0; p < t.levelCount && p < NVRM_TELEMETRY_MAX_LEVELS; p++) {
+                const NVRMTelemetryLevel &l = t.levels[p];
+                pubProfile(d, p, "Graphics(MHz)",       l.graphicsMhz);
+                pubProfile(d, p, "Graphics Min(MHz)",   l.graphicsMinMhz);
+                pubProfile(d, p, "Graphics Max(MHz)",   l.graphicsMaxMhz);
+                pubProfile(d, p, "Memory(MHz)",         l.memoryMhz);
+                pubProfile(d, p, "Memory Min(MHz)",     l.memoryMinMhz);
+                pubProfile(d, p, "Memory Max(MHz)",     l.memoryMaxMhz);
+            }
+        }
     }
 
     virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE {

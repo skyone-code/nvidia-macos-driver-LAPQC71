@@ -13,6 +13,7 @@
 #include "nvrm_bar_recover.h"
 #include "nvrm_shutdown_plan.h"
 #include "nvrm_aspm.h"
+#include "nvrm_telemetry.h"
 
 extern "C" void nv_xnu_power_refresh(void);   // nv_xnu_power.cpp
 #include <IOKit/IOService.h>
@@ -211,6 +212,9 @@ private:
     IOLock      *fUtilizationLock = nullptr;
     void        *fUtilizationState = nullptr;
     bool         fUtilizationStopping = false;
+    // The telemetry query rides on the same lock: it is another RM client and the
+    // same rule applies (one caller at a time, torn down under the PM gate).
+    void        *fTelemetryState = nullptr;
     uint32_t     fPassDone = 0;
     IOWorkLoop  *fWorkLoop = NULL;
     IOFilterInterruptEventSource *fIntSrc = NULL;
@@ -1977,6 +1981,7 @@ void NVRM::stop(IOService *provider)
             NvXnuPmUse pmUse;
             IOLockLock(fUtilizationLock);
             nvrm_free_utilization(&fUtilizationState);
+            nvrm_free_telemetry(&fTelemetryState);
             IOLockUnlock(fUtilizationLock);
         }
     }
@@ -2418,6 +2423,20 @@ IOReturn NVRM::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, voi
             LOG("utilization: a firmware read took %llu ms (limit %llu) - sampling stopped for this boot so the RM lock is not held again",
                 (unsigned long long)(utilNs / 1000000ull), (unsigned long long)(kUtilHangNs / 1000000ull));
         }
+        IOLockUnlock(fUtilizationLock);
+        nv_xnu_pm_exit(counted);
+        return ok ? kIOReturnSuccess : (ready ? kIOReturnIOError : kIOReturnNotReady);
+    }
+    if (fn && fn->isEqualTo(NVRM_TELEMETRY_FN)) {
+        NVRMTelemetry *sample = (NVRMTelemetry *)p1;
+        if (!sample || sample->version != NVRM_TELEMETRY_ABI_VERSION) return kIOReturnBadArgument;
+        if (!fUtilizationLock || isInactive()) return kIOReturnNotReady;
+        int counted = 0;
+        if (!nv_xnu_pm_try_enter(&counted)) return kIOReturnNotReady;
+        IOLockLock(fUtilizationLock);
+        const bool ready = !fUtilizationStopping && !isInactive() && fAdapter && fPassDone >= 2 &&
+                           OSAddAtomic(0, &fGpuPm) == kGpuPmRunning;
+        const bool ok = ready && nvrm_query_telemetry(fNv.gpu_id, &fTelemetryState, sample);
         IOLockUnlock(fUtilizationLock);
         nv_xnu_pm_exit(counted);
         return ok ? kIOReturnSuccess : (ready ? kIOReturnIOError : kIOReturnNotReady);
