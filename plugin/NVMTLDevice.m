@@ -576,8 +576,6 @@ __attribute__((constructor)) static void nvmtl_nvdec_in_decode_service(void)
         else g_video_blackwell = dev >= 0x2b00 && dev < 0x3000;   // no profile (older NVRM): the GB20x device-id block
         nvlog("nvdec: decode service, GPU 10de:%04x (%s): registering the decoders at load", dev,
               g_video_blackwell ? "Blackwell" : "before Blackwell");
-        nvmtl_nvdec_register();
-        nvmtl_nvdec_hevc_register();
         // Safari's GPU process, QuickTime and FaceTime decode here. Our own H.264 decoder hands out buffers with fixed
         // attributes, and in these clients the picture comes out green; libnvencvt reads the client's attributes. It is
         // rated above ours, so where it applies it is the one chosen.
@@ -984,11 +982,22 @@ static id nvmtl_refuse_before_init(id obj)
     nvmtl_gl_caps_enable();
     if (nvmtl_vk_vendor() == 0x1002 || nvmtl_vk_vendor() == 0x8086) nvmtl_nmxvt_register();
     if (nvmtl_vk_vendor() == 0x10de) {   /* NVDEC/NVENC are NVIDIA engines reached through NVRM */
-        nvmtl_nvdec_register();
-        nvmtl_nvenc_register();
-        nvmtl_nvdec_hevc_register();
-        nvmtl_nvenc_hevc_register();
-        nvmtl_nvencvt_register(false);   // last, so the external codecs register above ours
+        // Registering a VideoToolbox component makes VideoToolbox enumerate Metal devices on its own
+        // (VTCopyRenderIDArrayForIORegistryKey -> MTLCopyAllDevicesWithObserver -> __NSArrayI_new ->
+        // -[NSArray initWithArray:range:copyItems:]). Doing that inside initWithAcceleratorPort: hands the
+        // enumerator a device whose init has not returned yet, and the array's copyItems: pass then messages
+        // the half-built object: QQLive (com.tencent.tenvideo) died in lookUpImpOrForward / objc_retain with
+        // EXC_BAD_ACCESS when a video app - whose process has VideoToolbox fully initialised - opened and the
+        // registration below fired mid-init. Deferring to the next main-queue turn means the enumeration only
+        // ever sees a finished device; a process without a running main queue simply registers later or not
+        // at all, which costs hardware decode (falls back to software) but can never corrupt the device list.
+        dispatch_async(dispatch_get_main_queue(), ^{
+            nvmtl_nvdec_register();
+            nvmtl_nvenc_register();
+            nvmtl_nvdec_hevc_register();
+            nvmtl_nvenc_hevc_register();
+            nvmtl_nvencvt_register(false);   // last, so the external codecs register above ours
+        });
     }
     SEL il = sel_registerName("initLimits");
     if ([self respondsToSelector:il]) {
