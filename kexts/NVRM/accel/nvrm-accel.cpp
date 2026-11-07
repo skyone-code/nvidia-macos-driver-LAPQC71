@@ -134,6 +134,23 @@ SYSCTL_INT(_debug, OID_AUTO, nmxaccel_headless, CTLFLAG_RD | CTLFLAG_LOCKED | CT
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_headless, CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, &gNvHeadless, 0,
            "1 = no NVIDIA display: Metal device for apps only, WindowServer on the GPU that owns the display");
 #endif
+// ---- the last telemetry sample, mirrored for scripts ----------------------
+// PerformanceStatistics is a dictionary replaced wholesale every 0.25-2 s: reading one
+// key out of it means pausing whatever else writes it, and parsing ioreg for a number in a
+// shell loop is clumsy. These mirror the same sample once per second so `sysctl -a | grep
+// nvgpu` answers the same question. A value of -1 means "the card does not report it" --
+// distinct from 0 W, 0 MHz, which are real readings.
+static volatile int gNvGpuPowerMw = -1, gNvGpuPowerAvgMw = -1, gNvGpuPowerLimitMw = -1;
+static volatile int gNvGpuClockMhz = -1, gNvGpuMemClockMhz = -1;
+static volatile int gNvGpuTempC = -1, gNvGpuPstate = -1;
+#define NVGPU_READ(nm, var, desc) SYSCTL_INT(_debug, OID_AUTO, nm, CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, (int *)&var, 0, desc)
+NVGPU_READ(nvgpu_power_mw,        gNvGpuPowerMw,        "instantaneous GPU power, milliwatts (-1 = not reported)");
+NVGPU_READ(nvgpu_power_avg_mw,    gNvGpuPowerAvgMw,     "GPU power averaged over the last few 1 Hz samples, milliwatts");
+NVGPU_READ(nvgpu_power_limit_mw,  gNvGpuPowerLimitMw,   "enforced GPU power limit, milliwatts (-1 = not reported)");
+NVGPU_READ(nvgpu_clock_mhz,       gNvGpuClockMhz,       "graphics clock, MHz");
+NVGPU_READ(nvgpu_mem_clock_mhz,   gNvGpuMemClockMhz,    "memory clock, MHz");
+NVGPU_READ(nvgpu_temp_c,          gNvGpuTempC,          "GPU core temperature, degrees C");
+NVGPU_READ(nvgpu_pstate,          gNvGpuPstate,         "P-State (1 = P0 highest, 256 = P8 idle)");
 // 4 NVIDIA heads (nvfbheads=4) + 1 for an Intel built-in panel (NMIntelFB, IOFBDependentIndex 4): WindowServer composites
 // that panel on the NVIDIA card and the display-pipe copy path below writes each frame into the Intel scan-out surface.
 static const unsigned kNvMaxFB = 5;
@@ -349,6 +366,15 @@ public:
     NVRMTelemetry       fTel = {};
     uint64_t            fTelUpdated = 0;
     bool                fTelValid = false;
+    // Power smoothing. RUSD carries both an averaged and an instantaneous rail figure, but
+    // a part that tracks only one leaves the other at timestamp 0 -- TU104, for one, has no
+    // average at all (the sample dump reads "avg 0 inst <stamp>"). A ring over the last few
+    // 1 Hz samples reproduces the average on such a part instead of publishing a single
+    // point sample under a name that promises an average. Guarded by fUtilLock, like fTel.
+    static constexpr unsigned kNvPwrRing = 8;
+    unsigned            fPwrRing[kNvPwrRing] = {};
+    unsigned            fPwrRingLen = 0;
+    unsigned            fPwrRingIdx = 0;
     IONotifier *fFBNote = nullptr;
     IONotifier *fIntelNote = nullptr;
     IONotifier *fGopNote = nullptr;     // NMGopFB: an AMD integrated GPU's panel, published as head 4 with the hybrid switch on
@@ -1003,6 +1029,7 @@ public:
         fTempFails = 0;
         if (!fTempLogged) { fTempLogged = true; ALOG("temperature: first reading raw=0x%08x -> %u C", raw, val); }
         fTempC = (int)val;
+        gNvGpuTempC = (int)val;
     }
 
     void startUtilization() {
@@ -1024,6 +1051,10 @@ public:
             return;
         }
         fUtilTimer->setTimeoutMS(kNvTempFirstMs);
+        ALOG("telemetry: 1 Hz sampling; %u-sample power ring; publishing Core Clock(MHz), "
+             "Memory Clock(MHz), Total Power(W), Fan Speed(RPM), vramUsedBytes; "
+             "sysctl debug.nvgpu_{power,power_avg,power_limit,clock,mem_clock,temp,pstate}",
+             kNvPwrRing);
 #endif
     }
 
@@ -1130,10 +1161,39 @@ public:
             fTel = sample;
             fTelUpdated = mach_continuous_time();
             fTelValid = true;
+            // The ring holds whatever the part meters: its averaged figure when it tracks
+            // one, otherwise the instantaneous one, which is all TU104 offers.
+            unsigned mw = 0;
+            if (sample.valid & NVRM_TELEMETRY_VALID_POWER)      mw = sample.powerMw;
+            if (!mw && (sample.valid & NVRM_TELEMETRY_VALID_INST_POWER)) mw = sample.instPowerMw;
+            if (mw) {
+                fPwrRing[fPwrRingIdx] = mw;
+                fPwrRingIdx = (fPwrRingIdx + 1) % kNvPwrRing;
+                if (fPwrRingLen < kNvPwrRing) fPwrRingLen++;
+            }
+            gNvGpuPowerMw = mw ? (int)mw : -1;
+            gNvGpuPowerAvgMw = fPwrRingLen ? (int)powerRingAvgMw() : -1;
+            gNvGpuPowerLimitMw = (sample.valid & NVRM_TELEMETRY_VALID_POWER_LIMIT) ? (int)sample.powerLimitMw : -1;
+            gNvGpuClockMhz = (sample.valid & NVRM_TELEMETRY_VALID_CLOCK) ? (int)sample.clockGraphicsMhz : -1;
+            gNvGpuMemClockMhz = (sample.valid & NVRM_TELEMETRY_VALID_CLOCK) ? (int)sample.clockMemoryMhz : -1;
+            gNvGpuPstate = (sample.valid & NVRM_TELEMETRY_VALID_PSTATE) ? (int)sample.pstate : -1;
         } else {
             fTelValid = false;
+            // A sample that stopped arriving is not a GPU pulling 0 W: drop the window so
+            // the average cannot survive a sleep, a reset or a detached provider.
+            fPwrRingLen = fPwrRingIdx = 0;
+            gNvGpuPowerMw = gNvGpuPowerAvgMw = gNvGpuPowerLimitMw = -1;
+            gNvGpuClockMhz = gNvGpuMemClockMhz = gNvGpuPstate = -1;
         }
         IOLockUnlock(fUtilLock);
+    }
+
+    // Caller holds fUtilLock. Rounded mean of the ring, in milliwatts.
+    unsigned powerRingAvgMw() const {
+        if (!fPwrRingLen) return 0;
+        unsigned long long sum = 0;
+        for (unsigned i = 0; i < fPwrRingLen; i++) sum += fPwrRing[i];
+        return (unsigned)((sum + fPwrRingLen / 2) / fPwrRingLen);
     }
 
     // Read-copy-modify-write: the family keeps 70-odd keys in this dictionary and replaces it
@@ -1208,12 +1268,14 @@ public:
     void publishTelemetry(OSDictionary *d) {
         NVRMTelemetry t = {};
         bool valid = false;
+        unsigned avgMw = 0;
         if (fUtilLock) {
             IOLockLock(fUtilLock);
             uint64_t age = 0;
             if (fTelValid) absolutetime_to_nanoseconds(mach_continuous_time() - fTelUpdated, &age);
             valid = fTelValid && age <= kNvUtilMaxAgeNs;
             t = fTel;
+            avgMw = powerRingAvgMw();
             IOLockUnlock(fUtilLock);
         }
 
@@ -1244,6 +1306,11 @@ public:
             "GPU Row Remap Correctable", "GPU Row Remap Uncorrectable", "GPU Row Remap Pending",
             // v3: framebuffer occupancy, in bytes (64-bit -- an 8 GB card overflows 32).
             "GPU VRAM Used(Bytes)", "GPU VRAM Total(Bytes)",
+            // v4: the same readings under the key names iStat Menus and its peers look
+            // for on a real Mac's accelerator node. Our own names carry a "GPU" prefix,
+            // which is right for the registry but invisible to a tool expecting Apple's.
+            "Core Clock(MHz)", "Memory Clock(MHz)", "Total Power(W)", "GPU Power Avg(W)",
+            "Fan Speed(RPM)", "vramUsedBytes",
         };
         for (unsigned i = 0; i < sizeof kKeys / sizeof kKeys[0]; i++) d->removeObject(kKeys[i]);
         // The clock table's keys carry the profile number, so they are formatted rather
@@ -1293,6 +1360,13 @@ public:
             OSNumber *n = OSNumber::withNumber((unsigned long long)((t.memoryPowerMw + 500) / 1000), 32);
             if (n) { d->setObject("GPU Power Memory(W)", n); n->release(); }
         }
+        // Averaged draw, in watts. "Total Power(W)" is the name the monitoring tools read
+        // on an Apple accelerator node; "GPU Power Avg(W)" is ours. Both are the ring mean
+        // because on a part without a firmware average a single sample would be a lie.
+        if (avgMw) {
+            pubNum(d, "Total Power(W)", (avgMw + 500) / 1000);
+            pubNum(d, "GPU Power Avg(W)", (avgMw + 500) / 1000);
+        }
         if (t.valid & NVRM_TELEMETRY_VALID_THROTTLE) {
             OSNumber *n = OSNumber::withNumber((unsigned long long)t.throttleMask, 32);
             if (n) { d->setObject("GPU Throttle Mask", n); n->release(); }
@@ -1312,6 +1386,9 @@ public:
                 OSNumber *n = OSNumber::withNumber((unsigned long long)clocks[i].value, 32);
                 if (n) { d->setObject(clocks[i].key, n); n->release(); }
             }
+            // Apple's names, for the tools that only know those.
+            if (t.clockGraphicsMhz) pubNum(d, "Core Clock(MHz)", t.clockGraphicsMhz);
+            if (t.clockMemoryMhz)   pubNum(d, "Memory Clock(MHz)", t.clockMemoryMhz);
         }
 
         if (t.valid & NVRM_TELEMETRY_VALID_PSTATE) {
@@ -1345,6 +1422,9 @@ public:
         if (t.valid & NVRM_TELEMETRY_VALID_FAN) {
             pubNum(d, "GPU Fan RPM", t.fanRpm);
             pubNum(d, "GPU Fan Count", t.fanCount);
+            // Apple's spelling. A card whose firmware reports no fan leaves both keys out;
+            // a percentage would have to be invented from min/max, which is not published.
+            if (t.fanRpm) pubNum(d, "Fan Speed(RPM)", t.fanRpm);
         }
 
         if (t.valid & NVRM_TELEMETRY_VALID_RUSD_UTIL) {
@@ -1387,6 +1467,9 @@ public:
             if (t.vramUsedBytes) {
                 OSNumber *n = OSNumber::withNumber(t.vramUsedBytes, 64);
                 if (n) { d->setObject("GPU VRAM Used(Bytes)", n); n->release(); }
+                // iStat reads the occupancy out of this spelling.
+                n = OSNumber::withNumber(t.vramUsedBytes, 64);
+                if (n) { d->setObject("vramUsedBytes", n); n->release(); }
             }
             if (t.vramTotalBytes) {
                 OSNumber *n = OSNumber::withNumber(t.vramTotalBytes, 64);
@@ -2116,6 +2199,13 @@ static void nvaccelInstallSysctl(void)
 #else
     sysctl_register_oid(&sysctl__debug_nvaccelfb);
     sysctl_register_oid(&sysctl__debug_nvaccel_headless);
+    sysctl_register_oid(&sysctl__debug_nvgpu_power_mw);
+    sysctl_register_oid(&sysctl__debug_nvgpu_power_avg_mw);
+    sysctl_register_oid(&sysctl__debug_nvgpu_power_limit_mw);
+    sysctl_register_oid(&sysctl__debug_nvgpu_clock_mhz);
+    sysctl_register_oid(&sysctl__debug_nvgpu_mem_clock_mhz);
+    sysctl_register_oid(&sysctl__debug_nvgpu_temp_c);
+    sysctl_register_oid(&sysctl__debug_nvgpu_pstate);
     sysctl_register_oid(&sysctl__debug_nvaccel_vm_alloc);       sysctl_register_oid(&sysctl__debug_nvaccel_vm_alloc_bytes);
     sysctl_register_oid(&sysctl__debug_nvaccel_vm_dealloc);     sysctl_register_oid(&sysctl__debug_nvaccel_vm_dealloc_bytes);
     sysctl_register_oid(&sysctl__debug_nvaccel_vm_refused);
