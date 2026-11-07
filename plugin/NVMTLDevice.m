@@ -807,6 +807,29 @@ static uint64_t nvmtl_rt_gate_working_set(uint64_t ws)
     if (!said++) nvlog("working set: answered %lld MB instead of %llu MB while ray tracing is available (NVMTL_WS_RT_GATE_MB)", floor_mb, (unsigned long long)(ws >> 20));
     return (uint64_t)floor_mb << 20;
 }
+
+/* Metal keeps one MTLDevice per accelerator in a process-wide list that every MTLCopyAllDevices walks, and the block
+   that builds the returned array retains each entry. An entry we released - a device whose init path returned nil, or
+   one handed back while the registry still listed it - turns the next enumeration into EXC_BAD_ACCESS inside
+   -[NSArray initWithArray:range:copyItems:], which is exactly how QQLive died six times (objc_retain on a freed object,
+   then an objc runtime abort from lookUpImpOrForward on a torn isa). One reference per created device makes that list
+   safe and costs a handful of objects per process. NVMTL_KEEP_DEVICE=0 turns the pin off and only logs deallocs, which
+   is how the diagnosis was made. */
+static NSMutableArray *gNVMTLDevKeep;
+static void nvmtl_keep_device(id dev)
+{
+    static dispatch_once_t once;
+    static int pin = -1;
+    dispatch_once(&once, ^{
+        gNVMTLDevKeep = [NSMutableArray new];
+        const char *e = getenv("NVMTL_KEEP_DEVICE");
+        pin = (e && *e == '0') ? 0 : 1;
+    });
+    if (!pin) { nvlog("device %p NOT pinned (NVMTL_KEEP_DEVICE=0) - a dealloc line now means the list went stale", dev); return; }
+    @synchronized(gNVMTLDevKeep) { [gNVMTLDevKeep addObject:dev]; }
+    nvlog("device %p pinned for the life of the process (%lu device(s) created here)",
+          dev, (unsigned long)gNVMTLDevKeep.count);
+}
 @implementation NVMTLDevice
 @dynamic depth24Stencil8PixelFormatSupported, headless, location, locationNumber, lowPower, maxArgumentBufferSamplerCount, maxTransferRate, peerCount, peerGroupID, peerIndex, registryID, removable, sparseTileSizeInBytes, supportsPlacementSparse;
 + (void)load {
@@ -932,6 +955,7 @@ static void nvmtl_install_hw_resource_pools(id dev)
     set(dev, NSSelectorFromString(@"setHwResourcePool:count:"), pools, 3);
     nvlog("  hw resource pools: installed 3 (slot 2 + count)");
 }
+<<<<<<< HEAD
 /* A refusal before [super initWithAcceleratorPort:] must not free the object. Under ARC, returning nil from an init
    releases self, and -[_MTLDevice dealloc] then releases dispatch objects that only the superclass's init creates: a NULL
    dispatch_release on Metal's device queue, which killed the program inside MTLCopyAllDevices. The uninitialized object
@@ -941,6 +965,9 @@ static id nvmtl_refuse_before_init(id obj)
 {
     (void)CFBridgingRetain(obj);
     return nil;
+}
+- (void)dealloc {
+    nvlog("*** NVMTLDevice %p DEALLOCATED - Metal's device list may still hold this pointer ***", self);
 }
 - (instancetype)initWithAcceleratorPort:(mach_port_t)port {
     nvlog("-[NVMTLDevice initWithAcceleratorPort:%u] in %s", port, getprogname());
@@ -964,6 +991,7 @@ static id nvmtl_refuse_before_init(id obj)
     if (!nvmtl_card_wanted(port)) return nvmtl_refuse_before_init(self);   // nvmultigpu=1 only: this process drives another card
     self = [super initWithAcceleratorPort:port];
     if (!self) { nvlog("  super initWithAcceleratorPort: returned nil"); return nil; }
+    nvmtl_keep_device(self);   // pin before any path can return nil: a half-built device must never be freed under Metal's list
     {   /* one GPU per process: the plugin runs a single Vulkan device, so a second Metal device on another vendor's
            accelerator (a PC with an NVIDIA card and an AMD or Intel GPU) is refused rather than given the wrong GPU */
         uint16_t mine = nvmtl_vk_set_accelerator(port), live = nvmtl_vk_vendor();
