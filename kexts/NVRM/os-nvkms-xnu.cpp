@@ -225,9 +225,34 @@ void nvkms_xnu_resume(NvU32 gpuId, NvBool gpuOk)
 static struct NvKmsKapiFunctionsTable gKapiTable;
 void *nvkms_xnu_kapi_table(void)
 {
-    static bool filled;
-    if (!filled) { gKapiTable.versionString = NV_VERSION_STRING; if (!nvKmsKapiGetFunctionsTableInternal(&gKapiTable)) return NULL; filled = true; }
+    static bool filled, warned;
+    if (!filled) {
+        gKapiTable.versionString = NV_VERSION_STRING;
+        if (!nvKmsKapiGetFunctionsTableInternal(&gKapiTable)) return NULL;
+        // Latch only a table the framebuffer can actually use. NVRMFB asks for this table through nvDisplayPointers and
+        // then checks dupMemory and getFlipPendingStatus before it starts; a fill that leaves them NULL made it refuse
+        // with "nub lacks nvkms-kapi/phys-for-va properties" (seen on every boot since the 02:11 install, after the same
+        // card had enumerated six connectors at 01:51 and 02:07). Because the old code latched on the getter's success
+        // alone, one incomplete fill stayed incomplete for the rest of the boot: no framebuffer, no connector list, no
+        // head - with an HDMI monitor plugged in or not. Keep the table usable for our own bring-up and refill until
+        // NVRMFB's members are there.
+        const bool complete = gKapiTable.dupMemory && gKapiTable.getFlipPendingStatus;
+        filled = complete;
+        if (!complete && !warned) {
+            warned = true;
+            kprintf("NVRM-xnu: kapi table incomplete (dupMemory %u, getFlipPendingStatus %u) - NVRMFB cannot start on it,"
+                    " refilling on the next request\n",
+                    gKapiTable.dupMemory ? 1 : 0, gKapiTable.getFlipPendingStatus ? 1 : 0);
+        }
+    }
     return &gKapiTable;
+}
+// What NVRMFB checks before it starts: the two members past the table's head that the fill has left NULL when it ran too
+// early. Exposed so NVRM can decide whether a head can ever appear instead of holding the registry for one that cannot.
+void nvkms_xnu_kapi_state(unsigned *hasDup, unsigned *hasFlip)
+{
+    if (hasDup)  *hasDup  = gKapiTable.dupMemory ? 1 : 0;
+    if (hasFlip) *hasFlip = gKapiTable.getFlipPendingStatus ? 1 : 0;
 }
 }
 

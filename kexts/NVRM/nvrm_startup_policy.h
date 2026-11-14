@@ -38,6 +38,68 @@ static inline unsigned nvrmAutoGoSettleMs(bool bar1Placed, bool turing, bool hav
     return ms;
 }
 
+// How long auto-go waits for display heads before it stops waiting and releases the registry. Twenty seconds is what
+// the bring-up was proven with; nvrmheadwait (seconds, 0..20) overrides it for machines whose card never carries a
+// panel, where every one of those seconds is spent holding WindowServer back for a head that cannot appear.
+static inline unsigned nvrmHeadWaitSec(bool haveArg, unsigned argSec)
+{
+    return (haveArg && argSec <= 20) ? argSec : 20;
+}
+
+// How many times the level-1 write is retried after heads have published. Ten is the proven budget; nvrmarmtries
+// (1..10) overrides it.
+static inline unsigned nvrmArmTries(bool haveArg, unsigned argN)
+{
+    return (haveArg && argN >= 1 && argN <= 10) ? argN : 10;
+}
+
+// A card that has published no display nub at all by now has no connector list to enumerate, so no head can publish.
+// Waiting the rest of the head budget then costs the whole boot for nothing: release after this many seconds instead.
+// nvrmnubgrace (seconds, 0..20) overrides; 0 releases at the first poll.
+static inline unsigned nvrmNoNubGraceSec(bool haveArg, unsigned argSec)
+{
+    return (haveArg && argSec <= 20) ? argSec : 5;
+}
+
+// Grace spent when display nubs exist but none can answer the framebuffer's pointer request, so no framebuffer can
+// attach and no head can publish on this boot whatever is plugged into the HDMI port. Two seconds covers a table that
+// is published at the end of the bring-up without holding WindowServer for a head that cannot appear.
+// nvrmfbgrace (seconds, 0..20) overrides.
+static inline unsigned nvrmNoFbGraceSec(bool haveArg, unsigned argSec)
+{
+    return (haveArg && argSec <= 20) ? argSec : 2;
+}
+
+// How long auto-go holds the registry waiting for a head, decided from what the display side can report rather than
+// from one fixed number that has to suit both a laptop with nothing plugged in and the same laptop booted with an HDMI
+// monitor attached:
+//   connected > 0   a display sits on an NVIDIA connector: spend the full budget, a head is coming.
+//   connected == 0  the connector list enumerated and carries nothing: no head can appear, stop at once.
+//   connected < 0   no nub published a connector list. That is only temporary when a nub can answer the framebuffer's
+//                   pointer request (nvDisplayPointers): then the enumeration can still run this boot and the full
+//                   budget is spent. When no nub can answer, no framebuffer will attach at all and only a short grace
+//                   is worth holding WindowServer back for (the table can be published late in the bring-up).
+// anyNub == false keeps the full budget: the caller's own no-nub grace (nvrmNoNubGraceSec) decides that case.
+static inline unsigned nvrmHeadWaitBudgetSec(unsigned fullSec, unsigned noFbGraceSec,
+                                             int connected, bool anyNub, bool canAttach)
+{
+    if (connected > 0) return fullSec;
+    if (connected == 0 && anyNub) return 0;
+    if (!anyNub) return fullSec;
+    return canAttach ? fullSec : (noFbGraceSec < fullSec ? noFbGraceSec : fullSec);
+}
+
+// The level-1 write arms a head that exists. A display nub appearing does not mean a head can: on a machine whose
+// panel hangs off the iGPU, NVRM still publishes its nub, but no framebuffer attaches to it and no head is ever
+// published, so the ten tries spent logging "NEVER took" hold the registry for ten seconds for a write that cannot
+// land. Keep one extra try for a head that publishes late, then stop. A published head keeps the whole budget, and so
+// does an attached display (connected > 0): its head is only late, not absent, and the spare try would miss it.
+static inline unsigned nvrmArmTriesFor(unsigned armTries, unsigned headMask, int connected)
+{
+    if (headMask || connected > 0) return armTries;
+    return armTries < 2 ? armTries : 2;
+}
+
 // A firmware that sizes BAR1 above 8 GB (16 GB on an RTX 4060 Ti 16 GB, 32 GB on the largest cards) leaves a window
 // the bring-up has not run on: an RTX 3060 and an RTX 5080 resized to 16 GB both stopped during bring-up, and 8 GB is
 // the size proven on hardware. Returns the size to resize to (8 GB), or 0 to leave BAR1 as it is: already 8 GB or

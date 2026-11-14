@@ -10,6 +10,7 @@
 #include "nvrm_bar_limits.h"
 #include "nvrm_off_bar.h"
 #include "nvrm_startup_policy.h"
+#include "nvrm_gpuva_abi.h"
 #include "nvrm_bar_recover.h"
 #include "nvrm_shutdown_plan.h"
 #include "nvrm_aspm.h"
@@ -105,6 +106,7 @@ extern "C" int nvrm_dpaux_transfer(struct NVRMDpAuxRequest *r);   // nvrm_ddc.cp
 extern "C" void nv_xnu_log_init(void);
 extern "C" bool nv_xnu_maps_init(void);
 extern "C" void *nvkms_xnu_kapi_table(void);
+extern "C" void nvkms_xnu_kapi_state(unsigned *hasDup, unsigned *hasFlip);
 extern "C" NvU64 nv_xnu_phys_for_kernel_va(const void *va);
 class NVRMDisplay : public IOService { OSDeclareDefaultStructors(NVRMDisplay) };
 OSDefineMetaClassAndStructors(NVRMDisplay, IOService)
@@ -116,6 +118,22 @@ static void nvrm_display_publish(IOService *provider, NvU32 gpuId)
     if (gPublished) return;
     void *kapi = nvkms_xnu_kapi_table();
     if (!kapi) { kprintf("NVRM-xnu: no NVKMS kapi table, no display nub\n"); return; }
+    // NVRMFB probes once, in the millisecond these nubs register, and refuses to start unless the table carries
+    // dupMemory and getFlipPendingStatus. A fill that runs before NVKMS is up leaves those NULL, so complete the table
+    // first: five hundred milliseconds spent here is cheaper than a boot with no framebuffer, no connector list and no
+    // head (which is what a refused NVRMFB leaves behind, HDMI monitor or not).
+    {
+        unsigned dup = 0, flip = 0;
+        nvkms_xnu_kapi_state(&dup, &flip);
+        for (int i = 0; !(dup && flip) && i < 10; i++) {
+            IOSleep(50);
+            kapi = nvkms_xnu_kapi_table();
+            nvkms_xnu_kapi_state(&dup, &flip);
+        }
+        if (!(dup && flip))
+            kprintf("NVRM-xnu: kapi table still incomplete at nub publish (dupMemory %u, getFlipPendingStatus %u)"
+                    " - NVRMFB will refuse to start, so no display can be enumerated this boot\n", dup, flip);
+    }
     int want = 1;
     if (!PE_parse_boot_argn("nvfbheads", &want, sizeof want) || want < 1) want = 1;
     if (want > NVRM_MAX_HEADS) want = NVRM_MAX_HEADS;
@@ -959,6 +977,12 @@ void NVRM::measureBootRaster()
         const uint32_t raw0 = *(volatile uint32_t *)(b + 0x616330 + h * 0x800);
         uint64_t t0 = mach_absolute_time(), ns = 0, tFirst = 0, tLast = 0;
         if ((raw0 & 0xffff0000) == 0xbadf0000) { LOG("boot raster: head %u vline reads 0x%08x (PRI error) — unknown", h, raw0); continue; }
+        // A head that is not scanning never moves vline, and the full window then reports "unknown" a quarter of a
+        // second later. Four heads deep that is a whole second of the boot spent measuring nothing on a card with no
+        // display on it. Two milliseconds is thirty scan lines apart on any mode, so an unchanged vline means off.
+        IOSleep(2);
+        { const uint32_t still = *(volatile uint32_t *)(b + 0x616330 + h * 0x800) & 0xffff;
+          if (still == last) { LOG("boot raster: head %u not scanning (vline still %u) — unknown", h, still); continue; } }
         do {
             const uint32_t v = *(volatile uint32_t *)(b + 0x616330 + h * 0x800) & 0xffff;
             if (v != last) moves++;
@@ -1077,6 +1101,69 @@ static bool nvrmNoDisplayAnywhere()
     return nvrmNoDisplayOnAnyConnector(counts, n);
 }
 
+// How many NVRMDisplay nubs NVRMFB has published. Zero means the card has no connector list at all: no head can
+// publish, and the level-1 write has nothing to arm. On a Turing card without a panel (#496) that zero was invisible
+// to the old check, which read it as "not enumerated yet" and waited the full 20 s head budget plus the 10 s of
+// level-1 retries with the registry held busy - 30 s of a 57 s boot, every boot.
+static unsigned nvrmDisplayNubCount()
+{
+    unsigned n = 0;
+    if (OSIterator *it = IOService::getMatchingServices(IOService::serviceMatching("NVRMDisplay"))) {
+        while (OSObject *o = it->getNextObject()) if (OSDynamicCast(IOService, o)) n++;
+        it->release();
+    }
+    return n;
+}
+
+// The largest connected-displays count any display nub published, or -1 when none has: -1 means the framebuffer has
+// not enumerated this card's connector list yet, so "nothing is plugged in" is not something we know. A positive value
+// is the signal that matters for an HDMI monitor plugged in before boot (see nvrmHeadWaitBudgetSec).
+static int nvrmConnectedDisplayCount()
+{
+    int best = -1;
+    if (OSIterator *it = IOService::getMatchingServices(IOService::serviceMatching("NVRMDisplay"))) {
+        while (OSObject *o = it->getNextObject()) {
+            IOService *sv = OSDynamicCast(IOService, o);
+            OSNumber *cd = sv ? OSDynamicCast(OSNumber, sv->getProperty("connected-displays")) : nullptr;
+            if (!cd) continue;
+            const int v = (int)cd->unsigned32BitValue();
+            if (v > best) best = v;
+        }
+        it->release();
+    }
+    return best;
+}
+
+// True when a display nub answers the framebuffer's pointer request **and** the table it hands back is one NVRMFB will
+// accept. NVRMFB asks the nub for the NVKMS function table and physForVa through nvDisplayPointers (nvrm_gpuva_abi.h),
+// then checks dupMemory and getFlipPendingStatus before starting. When the fill ran too early those members are NULL and
+// it refuses with "nub lacks nvkms-kapi/phys-for-va properties" - no framebuffer, no connector list, no head, whatever
+// is plugged into the HDMI port. Asking the same questions the framebuffer asks keeps the head budget honest: a boot
+// that cannot produce a head does not hold WindowServer for twenty seconds, and a boot that can keeps the full budget.
+extern "C" void nvkms_xnu_kapi_state(unsigned *hasDup, unsigned *hasFlip);
+static bool nvrmDisplayCanAttach()
+{
+    unsigned dup = 0, flip = 0;
+    nvkms_xnu_kapi_state(&dup, &flip);
+    if (!dup || !flip) return false;
+    bool can = false;
+    if (OSIterator *it = IOService::getMatchingServices(IOService::serviceMatching("NVRMDisplay"))) {
+        while (OSObject *o = it->getNextObject()) {
+            IOService *sv = OSDynamicCast(IOService, o);
+            if (!sv) continue;
+            struct NVRMDisplayPointers ptrs = {};
+            ptrs.version = NVRM_DISPLAY_PTRS_ABI_VERSION;
+            const OSSymbol *fn = OSSymbol::withCStringNoCopy(NVRM_DISPLAY_PTRS_FN);
+            if (!fn) continue;
+            const IOReturn r = sv->callPlatformFunction(fn, false, &ptrs, nullptr, nullptr, nullptr);
+            fn->release();
+            if (r == kIOReturnSuccess && ptrs.kapi && ptrs.physForVa) { can = true; break; }
+        }
+        it->release();
+    }
+    return can;
+}
+
 void NVRM::autoGo(void *p0, wait_result_t)
 {
     NVRM *s = (NVRM *)p0;
@@ -1106,8 +1193,14 @@ void NVRM::autoGo(void *p0, wait_result_t)
         IOSleep(s->fAutoGoSettleMs);
     }
     s->measureBootRaster();
-    { thread_t hw = THREAD_NULL; s->retain();
-      if (kernel_thread_start(&NVRM::headWatch, s, &hw) == KERN_SUCCESS) thread_deallocate(hw); else s->release(); }
+    // Register-change tracing for bring-up work: reads 514 registers off BAR0 every 5 ms for as long as auto-go holds
+    // the registry plus 15 s, on the same card that is being brought up. Nothing consumes what it prints, so it waits
+    // behind nvrmheadwatch=1 instead of costing every boot.
+    { int want = 0;
+      if (PE_parse_boot_argn("nvrmheadwatch", &want, sizeof want) && want) {
+        thread_t th = THREAD_NULL; s->retain();
+        if (kernel_thread_start(&NVRM::headWatch, s, &th) == KERN_SUCCESS) thread_deallocate(th); else s->release();
+      } }
     { uint64_t t; clock_get_uptime(&t); absolutetime_to_nanoseconds(t, &s->fBringUpStartNs); }
     s->fBringUp = 1;
     IOReturn r = s->go(2);
@@ -1122,13 +1215,47 @@ void NVRM::autoGo(void *p0, wait_result_t)
     } else {
         s->setProperty("nvrm-autogo", "up");
         int want = 1; if (!PE_parse_boot_argn("nvfbheads", &want, sizeof(want)) || want < 1) want = 1;
+        // Boot-time budgets, each overridable so a machine can be tuned without a rebuild (see nvrm_startup_policy.h).
+        unsigned headWaitSec = 20, armTries = 10, nubGraceSec = 5, noFbGraceSec = 2;
+        { uint32_t v = 0; headWaitSec  = nvrmHeadWaitSec(PE_parse_boot_argn("nvrmheadwait", &v, sizeof(v)), v); }
+        { uint32_t v = 0; armTries     = nvrmArmTries(PE_parse_boot_argn("nvrmarmtries", &v, sizeof(v)), v); }
+        { uint32_t v = 0; nubGraceSec  = nvrmNoNubGraceSec(PE_parse_boot_argn("nvrmnubgrace", &v, sizeof(v)), v); }
+        { uint32_t v = 0; noFbGraceSec = nvrmNoFbGraceSec(PE_parse_boot_argn("nvrmfbgrace", &v, sizeof(v)), v); }
+        if (headWaitSec != 20 || armTries != 10 || nubGraceSec != 5 || noFbGraceSec != 2)
+            LOG("auto-go: budgets from boot arguments: head wait %u s, arm tries %u, no-nub grace %u s, no-framebuffer grace %u s",
+                headWaitSec, armTries, nubGraceSec, noFbGraceSec);
         // Hybrid laptops (boot-arg nmhybrid 1 or 2): the panel is another GPU's framebuffer, published as head 4 of this
         // accelerator. Arming before it exists leaves it without a pipe until a second write and a WindowServer restart,
         // so wait for it, bounded by the same 20 s as the NVIDIA heads.
         bool hyWait = false;
         { int lv = 0; const int present = PE_parse_boot_argn("nmhybrid", &lv, sizeof(lv)); hyWait = present && lv >= 1 && lv <= 4; }
-        int mask = 0, last = -1, still = 0, i;
-        for (i = 0; i < 20; i++) {
+        // What the display side can tell us right now decides the wait, so a boot with an HDMI monitor attached keeps
+        // the full budget while a boot with nothing plugged in stops as soon as "no head can appear" is known: an
+        // enumerated connector list that carries nothing, or a nub that cannot answer nvDisplayPointers (no framebuffer
+        // can attach, so no head can ever publish whatever is plugged in).
+        // NVRMFB enumerates the connectors about 70 ms after the nub publishes (05:37: go(2) returns 35.677 with
+        // connected still -1, "ENUMERATED: 0 connected display(s)" lands at 35.747), but the wait below only looks
+        // once a second, so "nothing is plugged in" used to be discovered ~0.9 s late. Poll in 50 ms steps for at
+        // most one second first: the decision is then taken on the real connector list, and a boot with nothing
+        // attached stops at the enumeration instead of at the next one-second tick. Worst case is unchanged (one
+        // second spent waiting to learn anything, exactly what the old first iteration cost).
+        for (int t = 0; t < 20 && nvrmConnectedDisplayCount() < 0; t++) IOSleep(50);
+        const unsigned nubCount = nvrmDisplayNubCount();
+        int connected = nvrmConnectedDisplayCount();
+        const bool canAttach = nvrmDisplayCanAttach();
+        unsigned headWait = nvrmHeadWaitBudgetSec(headWaitSec, noFbGraceSec, connected, nubCount > 0, canAttach);
+        if (hyWait) headWait = headWaitSec;   // the other GPU's panel is head 4: keep the full budget for it
+        if (headWait != headWaitSec) {
+            unsigned kapiDup = 0, kapiFlip = 0;
+            nvkms_xnu_kapi_state(&kapiDup, &kapiFlip);
+            LOG("auto-go: head wait %u s of %u: %s", headWait, headWaitSec,
+                connected == 0 ? "the connector list carries no display"
+                               : ((!kapiDup || !kapiFlip)
+                                  ? "the kapi table is incomplete (dupMemory/getFlipPendingStatus null), NVRMFB cannot start"
+                                  : "no display nub answers nvDisplayPointers, no framebuffer can attach"));
+        }
+        int mask = 0, last = -1, still = 0, noNub = 0, i;
+        for (i = 0; i < (int)headWait; i++) {
             if (nvrmSysR("debug.nvaccel_heads_published", &mask) != 0) mask = 0;
             if (hyWait) {
                 if (mask & 0x10) { LOG("auto-go: hybrid: the other GPU's panel published as head 4 after %d s", i); break; }
@@ -1143,22 +1270,40 @@ void NVRM::autoGo(void *p0, wait_result_t)
                 OSNumber *cd = OSDynamicCast(OSNumber, gDisplayNub0->getProperty("connected-displays"));
                 if (cd && cd->unsigned32BitValue() > 0 && (int)nvrmPop((unsigned)mask) >= (int)cd->unsigned32BitValue()) break;
             }
-            // Every connector list is enumerated and none carries a display (a panel on the Intel or AMD GPU): no head
-            // will ever publish, so waiting out the full twenty seconds only holds the registry for nothing.
-            if (!mask && nvrmNoDisplayAnywhere()) { LOG("auto-go: no display on any NVIDIA connector - not waiting for heads"); break; }
+            // Re-read the connector list on every poll, not just at entry: NVRMFB enumerates about 70 ms after the nub
+            // publishes (01:51: nub 15.875, "ENUMERATED: 0 connected display(s)" 15.948), so "nothing is attached" is
+            // known almost at once and ends the wait there instead of at the deadline. A display attached to the HDMI
+            // port keeps connected > 0 and the full budget, which is exactly the case this wait exists for.
+            connected = nvrmConnectedDisplayCount();
+            if (!mask && connected == 0) { LOG("auto-go: the connector list carries no display - not waiting for heads"); break; }
+            // No nub at all: NVRMFB has published no connector list, so no head can ever appear and waiting here only
+            // holds WindowServer back. The old check called this "not enumerated yet" and waited the full budget.
+            if (!mask && nvrmDisplayNubCount() == 0) {
+                if ((unsigned)++noNub >= nubGraceSec) {
+                    LOG("auto-go: no NVRMDisplay nub after %d s - no connector list to enumerate, not waiting for heads", i + 1);
+                    break;
+                }
+            } else noNub = 0;
             IOSleep(1000);
         }
         LOG("auto-go: heads published mask 0x%x (%u of nvfbheads %d) after %d s", mask, nvrmPop((unsigned)mask), want, i);
         s->fBringUp = 0;   // the cap may fire from here on; the next line decides whether it got there first
-        const bool earlyRelease = nvrmReleaseBeforeArming((unsigned)mask, nvrmNoDisplayAnywhere());
+        // No head will appear when the connector list enumerated nothing, and also when no nub can answer the
+        // framebuffer's pointer request: both mean arming has nothing to wait for, so do not hold the registry for it.
+        const bool noHeadPossible = nvrmNoDisplayAnywhere() || (connected < 0 && nubCount > 0 && !canAttach);
+        const bool earlyRelease = nvrmReleaseBeforeArming((unsigned)mask, noHeadPossible);
         if (!OSCompareAndSwap(1, 2, &s->fBootHold)) {
             LOG("auto-go: the hold was already released (cap) — NOT arming with WindowServer up; heads 0x%x", mask);
             s->setProperty("nvrm-display", "not armed: hold released by the cap first");
             s->release(); thread_terminate(current_thread()); return;
         }
         if (earlyRelease) s->releaseBootHold("no NVIDIA display head can arm yet; arming continues for a later hotplug");
+        const unsigned armBudget = nvrmArmTriesFor(armTries, (unsigned)mask, connected);
+        if (armBudget < armTries)
+            LOG("auto-go: no head published and no display attached - capping the level-1 write at %u tr%s instead of %u",
+                armBudget, armBudget == 1 ? "y" : "ies", armTries);
         int armed = 0;
-        for (i = 0; i < 10; i++) { nvrmSysW("debug.nvaccelfb", 1); nvrmSysR("debug.nvaccelfb", &armed); if (armed == 1) break; IOSleep(1000); }
+        for (i = 0; i < (int)armBudget; i++) { nvrmSysW("debug.nvaccelfb", 1); nvrmSysR("debug.nvaccelfb", &armed); if (armed == 1) break; IOSleep(1000); }
         if (armed == 1) nvrmSysW("debug.nvaccelfb", 4);
         LOG("auto-go: accelerator level 1 %s after %d tr%s%s", armed == 1 ? "took" : "NEVER took", i + 1, i ? "ies" : "y",
             armed == 1 ? ", level 4 written" : " — not arming further");

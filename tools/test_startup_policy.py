@@ -58,6 +58,29 @@ int main() {
     CHECK("a dead heartbeat with classification off waits for the third timeout (the 6 s x 3 stall)", !nvrmGspTimeoutFatal(false, false, false, 1, 3) && nvrmGspTimeoutFatal(false, false, false, 3, 3));
     CHECK("a slow but healthy GSP keeps today's count with classification on", !nvrmGspTimeoutFatal(false, true, true, 1, 3) && !nvrmGspTimeoutFatal(false, true, true, 2, 3));
     CHECK("a slow but healthy GSP that keeps timing out is still failed at the threshold", nvrmGspTimeoutFatal(false, true, true, 3, 3));
+    CHECK("the head wait stays at the proven 20 s without a boot argument", nvrmHeadWaitSec(false, 0) == 20);
+    CHECK("nvrmheadwait=2 shortens the head wait", nvrmHeadWaitSec(true, 2) == 2);
+    CHECK("nvrmheadwait=0 releases at the first poll", nvrmHeadWaitSec(true, 0) == 0);
+    CHECK("a head wait above the proven 20 s is ignored", nvrmHeadWaitSec(true, 60) == 20);
+    CHECK("the arm budget stays at the proven 10 tries without a boot argument", nvrmArmTries(false, 0) == 10);
+    CHECK("nvrmarmtries=2 shortens the arm budget", nvrmArmTries(true, 2) == 2);
+    CHECK("nvrmarmtries=0 is ignored (arming must be attempted once)", nvrmArmTries(true, 0) == 10);
+    CHECK("the no-nub grace is 5 s by default", nvrmNoNubGraceSec(false, 0) == 5);
+    CHECK("nvrmnubgrace=1 waits one second for a nub", nvrmNoNubGraceSec(true, 1) == 1);
+    CHECK("nvrmnubgrace=0 breaks at the first poll", nvrmNoNubGraceSec(true, 0) == 0);
+    CHECK("the no-framebuffer grace is 2 s by default", nvrmNoFbGraceSec(false, 0) == 2);
+    CHECK("nvrmfbgrace=0 releases at the first poll", nvrmNoFbGraceSec(true, 0) == 0);
+    CHECK("no head, no attached display: the arm budget is capped at two tries", nvrmArmTriesFor(10, 0, -1) == 2);
+    CHECK("no head and a budget of one keeps one try", nvrmArmTriesFor(1, 0, -1) == 1);
+    CHECK("a published head keeps the whole budget", nvrmArmTriesFor(10, 0x1, -1) == 10);
+    CHECK("a nub alone does not buy more tries (no head can arm)", nvrmArmTriesFor(10, 0, 0) == 2);
+    CHECK("an attached display keeps the whole arm budget while its head is late", nvrmArmTriesFor(10, 0, 1) == 10);
+    CHECK("an HDMI monitor attached at boot keeps the full head wait", nvrmHeadWaitBudgetSec(20, 2, 1, true, false) == 20);
+    CHECK("a connector list that enumerated nothing stops the wait at once", nvrmHeadWaitBudgetSec(20, 2, 0, true, true) == 0);
+    CHECK("a nub that cannot answer nvDisplayPointers costs only the grace", nvrmHeadWaitBudgetSec(20, 2, -1, true, false) == 2);
+    CHECK("a nub that can answer keeps the full budget (the enumeration can still run)", nvrmHeadWaitBudgetSec(20, 2, -1, true, true) == 20);
+    CHECK("no nub at all leaves the decision to the no-nub grace", nvrmHeadWaitBudgetSec(20, 2, -1, false, false) == 20);
+    CHECK("a short full budget still bounds the grace", nvrmHeadWaitBudgetSec(1, 20, -1, true, false) == 1);
     return bad;
 }
 '''
@@ -76,12 +99,21 @@ arm("NVAccel no longer compares against the fixed 60 s constant", "me->fHeadless
 arm("NVRM publishes its settle delay on the PCI device for NVAccel", 'fPCI->setProperty("nvrm-autogo-settle-ms"' in nvrm)
 arm("NVRM takes its settle delay from the policy (nvrmsettle override included)", "nvrmAutoGoSettleMs(" in nvrm)
 arm("auto-go stops waiting for heads when no connector carries a display", "nvrmNoDisplayAnywhere()" in nvrm and "not waiting for heads" in nvrm)
+arm("auto-go also stops when the card published no display nub at all", "nvrmDisplayNubCount() == 0" in nvrm and "no connector list to enumerate" in nvrm)
+arm("the arm budget is capped when no head published and no display is attached", "nvrmArmTriesFor(armTries, (unsigned)mask, connected)" in nvrm)
+arm("the head wait is decided from what the display side reports, not from a fixed number", "nvrmHeadWaitBudgetSec(" in nvrm and "nvrmConnectedDisplayCount()" in nvrm and "nvrmDisplayCanAttach()" in nvrm)
+arm("the no-framebuffer case releases the hold early too", "connected < 0 && nubCount > 0 && !canAttach" in nvrm)
+arm("the head wait, arm budget and no-nub grace come from the policy", "nvrmHeadWaitSec(" in nvrm and "nvrmArmTries(" in nvrm and "nvrmNoNubGraceSec(" in nvrm)
 arm("an early release still runs the arming that serves a later hotplug", "if (earlyRelease) s->releaseBootHold(" in nvrm and nvrm.index("if (earlyRelease) s->releaseBootHold(") < nvrm.index('nvrmSysW("debug.nvaccelfb", 1)') and "if (!earlyRelease) s->releaseBootHold(" in nvrm)
 arm("bus mastering from firmware is switched off until pass 2 enables it", "off until the RM starts the card" in nvrm and nvrm.index("off until the RM starts the card") < nvrm.index("fPCI->setBusMasterEnable(true)"))
 arm("GSP timeout classification is on by default and a boot-arg override still wins", 'rm_write_registry_dword(NULL, NULL, "RmGspTimeoutClassification", 1)' in nvrm and nvrm.index('"RmGspTimeoutClassification"') < nvrm.index('rm_parse_option_string(NULL, regdw)'))
 arm("a card the RM cannot name gets a model from the GPU profile", "nvrmFallbackModelName(" in nvrm)
 arm("a BAR1 that must grow past 4 GB is no longer refused outright when nothing but the window is missing", "nvrmFallbackWindowAllowed(fwBar1, newSize" in nvrm)
 arm("placeLargeBar1 resizes a firmware BAR1 above 8 GB through the proven path", "nvrmBar1ShrinkTarget(bar1Size, rbSupported, nvrmKeepBar1Size())" in nvrm)
+arm("a head that is not scanning is not measured for a quarter second", "not scanning (vline still" in nvrm)
+arm("register-change tracing waits behind nvrmheadwatch", 'PE_parse_boot_argn("nvrmheadwatch"' in nvrm)
+arm("the connector list is polled in 50 ms steps before the one-second wait loop",
+    "t < 20 && nvrmConnectedDisplayCount() < 0; t++) IOSleep(50)" in nvrm)
 
 if failures:
     print("FAILED:", ", ".join(failures))
