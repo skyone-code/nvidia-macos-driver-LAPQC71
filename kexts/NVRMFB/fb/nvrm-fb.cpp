@@ -167,6 +167,28 @@ static inline bool fbVerbose(void)
 }
 #define FBLOGV(fmt, ...) do { if (fbVerbose()) { IOLog("NVRM-fb: " fmt "\n", ##__VA_ARGS__); kprintf("NVRM-fb: " fmt "\n", ##__VA_ARGS__); } \
     { char _tb[220]; snprintf(_tb, sizeof _tb, fmt, ##__VA_ARGS__); FBTRACE(_tb); } } while (0)
+// Boot-arg nvfbphantom=1: when nothing is plugged into this card at boot, index 0 still publishes an IOFramebuffer
+// (one connection that reports "no display", no modes, no head, no scanout). WindowServer enumerates the display list
+// once at start-up, so a headless boot otherwise leaves this GPU out of it, and a monitor plugged in later gets its own
+// framebuffer only after WindowServer is gone ("WindowServer composites it only after a WindowServer restart",
+// nvrm-accel.cpp). With the placeholder in that list, the first display that appears is adopted by it in place and the
+// connect interrupt makes WindowServer light it. Off by default: a placeholder framebuffer is a state WindowServer has
+// never been shown by this driver.
+static int gPhantom = -1;
+static inline bool nvrmPhantomEnabled()
+{
+    if (gPhantom < 0) { uint32_t g = 0; gPhantom = (PE_parse_boot_argn("nvfbphantom", &g, sizeof g) && g) ? 1 : 0; }
+    return gPhantom == 1;
+}
+// Whether the offline placeholder reports a connection. Default 0: a display connect for a connector with nothing on it
+// puts a phantom entry into the framework's display set, and restoring a set that carries one cost the primary display
+// its refresh rate (#138 section 8). nvfbphantomconn=1 restores the always-connected answer.
+static int gPhantomConn = -1;
+static inline bool nvrmPhantomConn()
+{
+    if (gPhantomConn < 0) { uint32_t g = 0; gPhantomConn = (PE_parse_boot_argn("nvfbphantomconn", &g, sizeof g) && g) ? 1 : 0; }
+    return gPhantomConn == 1;
+}
 static const char kPixelFormats[] = IO32BitDirectPixels "\0";
 static const UInt32 kNVRMFBSetTransform = 0x00000400;   // kIOFBSetTransform
 static const IODisplayModeID kModeId = 1;
@@ -613,6 +635,10 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     IOReturn switchSurround(IODisplayModeID id);
     void surroundReplicate(struct NvKmsKapiRequestedModeSetConfig *cfg);
     bool fSpareIndex = false;   // kapiInit stopped because this index has no display to drive (expected, not a failure)
+    // Published with nothing connected (nvfbphantom=1): no head, no mode, no scanout, the connection reports no display.
+    // The first display that appears is brought up on this same IOFramebuffer -- see adoptFirstDisplay().
+    bool fPhantom = false;
+    bool adoptFirstDisplay();
     void surveyBar1();
     bool fConsoleAperture = false;
     NvU64 fBar1Base = 0;
@@ -750,6 +776,11 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     unsigned    fFlipCacheN = 0, fFlipCount = 0, fFlipRejects = 0, fFlipEvict = 0;
     struct NvKmsKapiSurface *fFrontSurf = nullptr;
     static inline volatile SInt32 sFlipLatched[8] = {};
+    // Bring-up diagnostics: how many times the framework opened this framebuffer (the display stack opens, then closes,
+    // a framebuffer it cannot use -- so a count that stays at one after a display appeared means nothing ever came back
+    // to look), and how many connect interrupts we delivered.
+    static inline volatile SInt32 sOpenCount = 0, sConnFires = 0;
+    bool fRefired = false;
     bool flipToMemory(struct NvKmsKapiMemory *mem, unsigned w, unsigned h, unsigned pitch, int *rcOut, bool pure = false, UInt64 cookie = 0);
     bool fSubmissionSeen = false, fSubmissionFaulted = false;
     // When the tracked flip was committed, so a flip still pending can be told late (another period will do) from
@@ -828,6 +859,16 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     bool applyMode();
     void hudDraw();
 public:
+    // WindowServer opens every framebuffer once at startup; a framebuffer whose display cannot be brought online is
+    // closed and, from then on, only a connect change can bring it back. Counting opens says which of the two happened.
+    IOReturn open() override
+    {
+        const IOReturn err = IOFramebuffer::open();
+        const int n = (int)(OSAddAtomic(1, &sOpenCount) + 1);
+        setProperty("NVRMOpenCount", (unsigned long long)n, 32);
+        FBLOG("fb%u: open #%d -> 0x%x", fIndex, n, (unsigned)err);
+        return err;
+    }
     bool start(IOService *provider) override;
     void stop(IOService *provider) override;
     using IOFramebuffer::setProperty;
@@ -849,6 +890,7 @@ public:
     // display's native-raster modes at every refresh rate NVKMS validated are offered from the first query on.
     IOItemCount getDisplayModeCount() override {
         if (fProxy) return 1;
+        if (fPhantom) return 0;   // no display yet: nothing to offer, and addKmsRefreshModes has no display handle to ask
         if (!fNDT) {
             unsigned n = 0;
             if (fModeSet && fCurId != kModeId && fCurDT.pixelClock) { fDT[0] = fCurDT; fDT[0].detailedTimingModeID = (UInt32)fCurId; n = 1; }
@@ -858,10 +900,12 @@ public:
     IOReturn getDisplayModes(IODisplayModeID *allDisplayModes) override {
         unsigned k = 0;
         if (fProxy) { allDisplayModes[0] = kModeId; return kIOReturnSuccess; }
+        if (fPhantom) return kIOReturnSuccess;   // no modes at all while no display is connected
         if (listBootMode()) allDisplayModes[k++] = kModeId;
         for (unsigned i = 0; i < fNDT; i++) allDisplayModes[k++] = (IODisplayModeID)fDT[i].detailedTimingModeID;
         return kIOReturnSuccess; }
     bool listBootMode() const {
+        if (fPhantom) return false;
         if (fBootInDT) return false;
         if (!fTransform || !fBootW) return true;
         for (unsigned i = 0; i < fNDT; i++) if (!(fDT[i].detailedTimingModeID & 0x80000000u) && dtIsBootRaster(fDT[i])) return false;
@@ -879,6 +923,12 @@ public:
     IODeviceMemory *getApertureRange(IOPixelAperture aperture) override;
     uint32_t fVramLogged = 0;
     IODeviceMemory *getVRAMRange() override;
+    bool fPhantomVramLogged = false;
+    // The offline placeholder has no head and no surface, so both ranges used to answer NULL. The framework maps the
+    // card's video memory right after IOServiceOpen and drops the framebuffer when that range comes back NULL ("Failed
+    // to map VRAM"), which is why WindowServer let go of this framebuffer and never came back for a display plugged in
+    // later. Answer with BAR1 while the placeholder is offline, the way v12.6's placeholderVram() did.
+    IODeviceMemory *phantomVram();
 
     IOReturn callPlatformFunction(const OSSymbol *functionName, bool waitForFunction,
                                   void *param1, void *param2, void *param3, void *param4) APPLE_KEXT_OVERRIDE;
@@ -909,7 +959,7 @@ public:
         { if (flags) *flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | kDisplayModeDefaultFlag;
           return kIOReturnSuccess; }
     IOReturn setAttributeForConnection(IOIndex connectIndex, IOSelect attribute, uintptr_t value) override;
-    IOItemCount getConnectionCount() override { return 1; }
+    IOItemCount getConnectionCount() override { return (fPhantom && !nvrmPhantomConn()) ? 0 : 1; }
     bool hasDDCConnect(IOIndex) override { return !fDpyLost && !fHidden && fEdidSize >= 128; }
     IOReturn getDDCBlock(IOIndex connectIndex, UInt32 blockNumber, IOSelect blockType, IOOptionBits options, UInt8 *data, IOByteCount *length) override;
     // DDC/CI (boot-arg nvrmfbddc=1): one I2C bus per external display, transfers run by NVRM (nvrm_ddc.cpp).
@@ -1392,6 +1442,16 @@ bool NVRMNVDAFramebuffer::kapiInit()
               "frames are copied to the panel's framebuffer", fPxW, fPxH, fPxPitch);
         return true;
     }
+    if (gNDpy <= 0 && fIndex == 0 && nvrmPhantomEnabled()) {
+        // Nothing connected at boot. Publish anyway so this GPU is in the display list WindowServer builds at start-up;
+        // the connection is reported as having no display (fDpyLost) and there is no mode to set, so WindowServer has
+        // nothing to composite here until a display appears -- see adoptFirstDisplay().
+        fPhantom = true; fDpyLost = true;
+        setProperty("NVRMPhantom", (unsigned long long)1, 32);
+        FBLOG("index 0: no display connected at boot -- publishing a placeholder framebuffer (nvfbphantom=1): "
+              "WindowServer learns this GPU now, the first display plugged in adopts it without a restart");
+        return true;
+    }
     if (gNDpy <= 0 || fIndex >= (unsigned)gNDpy) {
         FBLOG("index %u: only %d display(s) connected -- nothing to drive, not starting", fIndex, gNDpy);
         fSpareIndex = gNDpy > 0;
@@ -1780,8 +1840,17 @@ void NVRMNVDAFramebuffer::connectNotifyFire(thread_call_param_t p0, thread_call_
     }
     OSCompareAndSwap(1, 0, &me->fConnectOwed);
     me->fConnectFired = true;
-    FBLOG("fb%u -> connect interrupt (the framework's registered handler)", me->fIndex);
+    const int fired = (int)(OSAddAtomic(1, &sConnFires) + 1);
+    me->setProperty("NVRMConnFires", (unsigned long long)fired, 32);
+    FBLOG("fb%u -> connect interrupt #%d (the framework's registered handler)", me->fIndex, fired);
     me->fConnect.proc(me->fConnect.target, me->fConnect.ref);
+    if (!me->fRefired) {
+        // One more a few seconds later. The framework drops a connect change while an earlier one is still marked "in
+        // progress" (fFbs[0]->messaged, cleared only when the display stack finishes the change), and the first change
+        // we fire after a boot-made placeholder is exactly the one that can be swallowed that way.
+        me->fRefired = true;
+        me->notifyConnectionChanged(6000);
+    }
 }
 // A different monitor on this framebuffer's connector: take its EDID (what getDDCBlock hands macOS), its physical size,
 // its display-audio ELD, and the scaler/raster ceilings its own mode list allows. The scanout allocation made at start
@@ -1936,6 +2005,57 @@ void NVRMNVDAFramebuffer::adoptSwappedDisplay()
           (unsigned)fEdidSize, (unsigned)fEdidMmW, (unsigned)fEdidMmH, (unsigned)oldW, (unsigned)oldH,
           (unsigned)fScalerMaxW, (unsigned)fScalerMaxH,
           short_ ? "; its largest modes need more scanout memory than this start reserved - full size after a restart" : "");
+}
+// A display appeared and this instance is the placeholder published at boot: do everything a boot with the display
+// already attached would have done -- display record, head, EDID, scanout allocation, mode, surface -- on this same
+// IOFramebuffer, then tell the framework the connection changed. WindowServer enumerated this framebuffer at start-up,
+// so the connect interrupt is handled exactly like the one a re-plugged display fires: no WindowServer restart.
+bool NVRMNVDAFramebuffer::adoptFirstDisplay()
+{
+    if (!fPhantom) return false;
+    if (gNDpy <= 0 || fIndex >= (unsigned)gNDpy) return false;
+    // The placeholder only ever exists for a display-less boot, so the boot-raster search found nothing and gBootHead is
+    // already -1 with gBootDpy 0: kapiInit() below takes the ordinary enumeration path with no boot reservation.
+    FBLOG("phantom fb%u: display 0x%x appeared -- adopting it in place (no restart)", fIndex, (unsigned)gDpy[fIndex].handle);
+    fPhantom = false;
+    fDpyLost = false;
+    removeProperty("NVRMPhantom");
+    IORecursiveLock *sl = startLock();
+    if (sl) IORecursiveLockLock(sl);
+    const bool ok = kapiInit();
+    if (sl) IORecursiveLockUnlock(sl);
+    if (!ok) {
+        fPhantom = true; fDpyLost = true;
+        setProperty("NVRMPhantom", (unsigned long long)1, 32);
+        FBLOG("phantom fb%u: adoption failed -- staying a placeholder until the next boot", fIndex);
+        return false;
+    }
+    fHotplugBorn = true;
+    const bool lit = applyMode();
+    // What the display side will see if it ever looks again: the mode count is the whole story for a framebuffer that
+    // was registered with none, so publish it next to the rest of the bring-up state.
+    const IOItemCount modes = getDisplayModeCount();
+    setProperty("NVRMModeCount", (unsigned long long)modes, 32);
+    setProperty("NVRMAdoptedLit", (unsigned long long)(lit ? 1 : 0), 32);
+    FBLOG("phantom fb%u: adopted display 0x%x on head %u %ux%u%s, %u mode(s) on offer -- telling the display stack the "
+          "connection is new", fIndex, (unsigned)fDisplay, fHead, fW, fH,
+          lit ? " (head lit)" : " (mode set refused; the display stack asks for one)", (unsigned)modes);
+    if (!fConnect.proc) {
+        // IOFramebuffer records the handler WindowServer registers when it opens a framebuffer. None here means the
+        // placeholder was never opened -- the connect interrupt would have nowhere to go, so this head is lit but the
+        // desktop stays on the other GPU until WindowServer is restarted once. Published as a property so a script can
+        // see it; the alternative (restarting WindowServer from the kernel) is not something a kext may do.
+        setProperty("NVRMPhantomNoWaiter", (unsigned long long)1, 32);
+        FBLOG("phantom fb%u: no connect handler was ever registered -- WindowServer never opened the placeholder; the head "
+              "is lit, and moving the desktop here needs one WindowServer restart", fIndex);
+        return true;
+    }
+    // Fire it whether or not one went out earlier: a connect change fired while this framebuffer still had no display
+    // (or before the display stack was listening) is exactly the one the framework may have dropped, and it counts as
+    // "already fired" for the purpose of this flag. The second, later one comes from connectNotifyFire.
+    fRefired = false;
+    notifyConnectionChanged(1200);
+    return true;
 }
 void NVRMNVDAFramebuffer::hotplugKick()
 {
@@ -2117,6 +2237,12 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
         fb->release();
     }
     surroundCheck();
+    if (added && me->fPhantom && me->adoptFirstDisplay()) {
+        // Index 0 belongs to the boot placeholder, which just took the display: re-matching nub 0 would start a second
+        // framebuffer for the same display, and WindowServer knows only the placeholder.
+        FBLOG("hot-plug: %d display(s) added, adopted by the boot placeholder -- no idle nub to re-match", added);
+        return;
+    }
     if (!added) {   // still nothing: a boot that found no display keeps looking, 3 s apart, a few times
         if (gNDpy == 0 && gBootRetry < kNvrmBootRetries) {
             const unsigned ms = nvrmBootRetryDelayMs(gBootRetry++);
@@ -3239,11 +3365,8 @@ bool NVRMNVDAFramebuffer::start(IOService *provider)
         if (gFBs[fIndex] != this) { retain(); if (gFBs[fIndex]) gFBs[fIndex]->release(); gFBs[fIndex] = this; }
         if (sl) IORecursiveLockUnlock(sl);
     }
-    // A display index at or past the boot enumeration means this display appeared after boot (hotplugFire added it to
-    // gDpy and re-registered the idle nub). Such an instance has to fire the framework's connect handler once its head
-    // has a mode -- see connectNotifyFire and enableController.
-    fHotplugBorn = (gNDpyBoot >= 0 && (int)fIndex >= gNDpyBoot);
-    if (fHotplugBorn) FBLOG("fb%u: a display appeared after boot -- the connect interrupt will be fired once the head has a mode", fIndex);
+    // fHotplugBorn is decided after kapiInit(), which is what tells a placeholder apart from a hot-plug instance: both
+    // sit at gNDpyBoot == 0 on a boot with no display.
     fPhysForVa = (nvrm_phys_for_va_t)displayPtrs.physForVa;
     if (!fKms || !fPhysForVa || !fKms->getFlipPendingStatus || !fKms->dupMemory) { FBLOG("nub lacks nvkms-kapi/phys-for-va properties"); return false; }
     setProperty("IOFBDependentID", (unsigned long long)0x4E56524D00000001ull, 64);
@@ -3264,7 +3387,25 @@ bool NVRMNVDAFramebuffer::start(IOService *provider)
                   "nothing half-registered to unwind and the machine stays up without a display.");
         return false;
     }
+    // A display index at or past the boot enumeration means this display appeared after boot (hotplugFire added it to
+    // gDpy and re-registered the idle nub). Such an instance has to fire the framework's connect handler once its head
+    // has a mode -- see connectNotifyFire and enableController. A placeholder also sits at gNDpyBoot == 0 with nothing
+    // to light: it only becomes a hot-plug instance when it adopts a display, which start() does in adoptFirstDisplay().
+    fHotplugBorn = !fPhantom && (gNDpyBoot >= 0 && (int)fIndex >= gNDpyBoot);
+    if (fHotplugBorn) FBLOG("fb%u: a display appeared after boot -- the connect interrupt will be fired once the head has a mode", fIndex);
     setName("NVRMFramebuffer");
+    if (fPhantom) {
+        // No display, no head, no scanout, no mode list: this instance exists only to be in the display list WindowServer
+        // builds at start-up. Everything a boot with a display present would have set up happens in adoptFirstDisplay().
+        { char loc[12]; if (nvrmFbLocation(fIndex, loc, sizeof loc)) setLocation(loc); }
+        if (!super::start(provider)) { FBLOG("phantom: super::start failed"); return false; }
+        fSleepTap = addFramebufferNotification(&NVRMNVDAFramebuffer::sleepTap, this, nullptr);
+        registerPowerDriver(this, kFBPowerStates, 2);
+        FBLOG("phantom: published on %s with no display attached (connection reports no display, no modes, no scanout); "
+              "the first display plugged in adopts it", provider->getName());
+        fbGuardCleared("the placeholder framebuffer published with no display attached");
+        return true;
+    }
     if (fProxy) {
         if (!super::start(provider)) { FBLOG("proxy: super::start failed"); return false; }
         fVblTimer = nvrmfbCall(vblFire, this);
@@ -3524,6 +3665,9 @@ IOReturn NVRMNVDAFramebuffer::enableController()
 {
     FBLOG("enableController");
     if (fProxy) return kIOReturnSuccess;
+    // The placeholder has no mode to set. It must answer success all the same: IOFramebuffer::open() marks a framebuffer
+    // whose enableController failed as dead for good and WindowServer's IOServiceOpen on it then fails.
+    if (fPhantom) { FBLOG("enableController: placeholder, no display to enable"); return kIOReturnSuccess; }
     fEnableAbs = mach_absolute_time();
     const bool ok = applyMode();
     // A failed boot mode set must not fail the open. IOFramebuffer::open() marks a framebuffer whose enableController
@@ -3548,6 +3692,7 @@ IOReturn NVRMNVDAFramebuffer::setDisplayMode(IODisplayModeID mode, IOIndex depth
 {
     FBLOG("fb%u setDisplayMode 0x%x depth %d (current 0x%x)", fIndex, (unsigned)mode, (int)depth, (unsigned)fCurId);
     if (fProxy) return (mode == kModeId && depth == 0) ? kIOReturnSuccess : kIOReturnUnsupportedMode;
+    if (fPhantom) return kIOReturnUnsupportedMode;   // no display: nothing to switch
     NVRMBoundedGate modeGate(kModeChangeGateMs);   // held to the end of the call; the inner gates are recursive
     if (!modeGate.held()) {
         FBLOG("fb%u setDisplayMode 0x%x: the display gate was not free in %u ms (another framebuffer is starting, relighting or "
@@ -5156,9 +5301,40 @@ IOReturn NVRMNVDAFramebuffer::newUserClient(task_t owningTask, void *securityID,
     return rc;
 }
 
+// BAR1 as the placeholder's video memory. The framework maps this right after IOServiceOpen; NULL there drops the
+// framebuffer for good ("Failed to map VRAM" -- #138's second gate), so an offline placeholder must answer it.
+IODeviceMemory *NVRMNVDAFramebuffer::phantomVram()
+{
+    IOService *nub = pciNub();
+    if (!nub) { setProperty("NVRMVramGate", 0ull, 32); FBLOG("phantom VRAM: no IOPCIDevice ancestor"); return nullptr; }
+    const IOItemCount n = nub->getDeviceMemoryCount();
+    IODeviceMemory *best = nullptr;
+    for (IOItemCount i = 0; i < n; i++) {
+        IODeviceMemory *m = (IODeviceMemory *)nub->getDeviceMemoryWithIndex(i);
+        if (!m) continue;
+        const addr64_t pa = m->getPhysicalSegment(0, 0, kIOMemoryMapperNone);
+        if (fBar1Base && (NvU64)pa == fBar1Base) { best = m; break; }
+        if (m->getLength() >= (32ull << 20) && (!best || m->getLength() > best->getLength())) best = m;
+    }
+    if (!best) {
+        setProperty("NVRMVramGate", 0ull, 32);
+        FBLOG("phantom VRAM: no BAR found -- the open will fail its VRAM map");
+        return nullptr;
+    }
+    best->retain();
+    setProperty("NVRMVramGate", 1ull, 32);
+    if (!fPhantomVramLogged) {
+        fPhantomVramLogged = true;
+        FBLOG("phantom VRAM: BAR pa 0x%llx len %llu (BAR1 was 0x%llx)",
+              (unsigned long long)best->getPhysicalSegment(0, 0, kIOMemoryMapperNone),
+              (unsigned long long)best->getLength(), (unsigned long long)fBar1Base);
+    }
+    return best;
+}
 IODeviceMemory *NVRMNVDAFramebuffer::getVRAMRange()
 {
     if (fProxy) return IODeviceMemory::withRange((IOPhysicalAddress)fPxBase, (IOPhysicalLength)fPxBytes);
+    if (fPhantom) return phantomVram();   // no surface yet: BAR1 satisfies the framework's VRAM map
     NvU64 target = fPhys ? fPhys : fConsPhys;
     IOService *nub = pciNub();
     if (nub && target) {
@@ -5187,6 +5363,7 @@ IODeviceMemory *NVRMNVDAFramebuffer::getApertureRange(IOPixelAperture aperture)
 {
     if (aperture != kIOFBSystemAperture) return NULL;
     if (fProxy) return IODeviceMemory::withRange((IOPhysicalAddress)fPxBase, (IOPhysicalLength)fPxBytes);
+    if (fPhantom) return phantomVram();   // same reason as getVRAMRange: there is no scanout aperture yet
     NvU64 target = (fConsoleAperture && fConsPhys) ? fConsPhys : fPhys;
     if (!target) return NULL;
     const NvU64 owned = fConsoleAperture ? fConsSize : fMemBytes;
@@ -5356,14 +5533,19 @@ IOReturn NVRMNVDAFramebuffer::getAttributeForConnection(IOIndex connectIndex, IO
 {
     FBSEL(attribute);
     switch (attribute) {
-    case kConnectionEnable: if (value) *value = (fDpyLost || fHidden) ? 0 : 1; FBLOGV("getAFC '%s' -> enable %u", _s, (unsigned)((fDpyLost || fHidden) ? 0 : 1)); return kIOReturnSuccess;
+    // A placeholder (nvfbphantom=1) reports its one connection as ENABLED even though it has no mode and no scanout. The
+    // framework creates the display nub from this answer during start(), and WindowServer enumerates that nub: with
+    // enable=0 nothing was ever created to re-probe, so the connect interrupt fired at a connection WindowServer had no
+    // object for and the head stayed invisible until a restart. Enabled with an empty mode list is the state a display
+    // that is present but gives no timings is in, which WindowServer already knows how to wait on.
+    case kConnectionEnable: if (value) *value = (!fDpyLost && !fHidden) ? 1 : 0; FBLOGV("getAFC '%s' -> enable %u", _s, (unsigned)((!fDpyLost && !fHidden) ? 1 : 0)); return kIOReturnSuccess;
     case kConnectionFlags:  if (value) *value = fInternal ? kIOConnectionBuiltIn : 0; return kIOReturnSuccess;
     case kConnectionColorModesSupported:       if (value) *value = 0x00000001; return kIOReturnSuccess;
     case kConnectionColorDepthsSupported:      if (value) *value = 0x00000002; return kIOReturnSuccess;
     case kConnectionControllerColorDepth:      if (value) *value = 0x00000002; return kIOReturnSuccess;
     case kConnectionControllerDepthsSupported: if (value) *value = 0x00000002; return kIOReturnSuccess;
     case kConnectionColorMode:                 if (value) *value = 0x00000001; return kIOReturnSuccess;
-    case kConnectionCheckEnable:               if (value) *value = (fDpyLost || fHidden) ? 0 : 1; return kIOReturnSuccess;
+    case kConnectionCheckEnable:               if (value) *value = (!fDpyLost && !fHidden) ? 1 : 0; return kIOReturnSuccess;
     case kConnectionDisplayFlags:              if (value) *value = 0; return kIOReturnSuccess;
     case kConnectionSupportsHLDDCSense:
         FBLOGV("fb%u getAFC HLDDCSense -> %s (EDID %u B)", fIndex, fEdidSize >= 128 ? "YES" : "no", (unsigned)fEdidSize);

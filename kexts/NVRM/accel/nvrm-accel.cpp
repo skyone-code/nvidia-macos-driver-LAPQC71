@@ -567,7 +567,11 @@ public:
         NVAccel *me = (NVAccel *)p0;
         if (!me || me != gAccel) return;
         if (me->fRegLock) IOLockLock(me->fRegLock);
-        const char *why = me->fFB ? "a display head published" : !me->fMetalPlugin ? "no plugin name to restore"
+        // A placeholder framebuffer (NVRMFB boot-arg nvfbphantom=1) is published with no display attached. It is in the
+        // display list WindowServer built, but it is not a head that can show anything yet: counting it here would keep
+        // MetalPluginName withheld for good and leave the display a plug later adopts with no GPU to composite on.
+        const bool phantomHead = me->fFB && me->fFB->getProperty("NVRMPhantom") != nullptr;
+        const char *why = (me->fFB && !phantomHead) ? "a display head published" : !me->fMetalPlugin ? "no plugin name to restore"
                         : me->getProperty("MetalPluginName") ? "the plugin name is already back" : nullptr;
         me->fHeadlessWaited += kHeadlessPollSec;
         if (why) {
