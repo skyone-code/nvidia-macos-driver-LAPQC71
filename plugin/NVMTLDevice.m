@@ -955,7 +955,6 @@ static void nvmtl_install_hw_resource_pools(id dev)
     set(dev, NSSelectorFromString(@"setHwResourcePool:count:"), pools, 3);
     nvlog("  hw resource pools: installed 3 (slot 2 + count)");
 }
-<<<<<<< HEAD
 /* A refusal before [super initWithAcceleratorPort:] must not free the object. Under ARC, returning nil from an init
    releases self, and -[_MTLDevice dealloc] then releases dispatch objects that only the superclass's init creates: a NULL
    dispatch_release on Metal's device queue, which killed the program inside MTLCopyAllDevices. The uninitialized object
