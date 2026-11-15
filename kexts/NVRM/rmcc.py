@@ -18,6 +18,10 @@ for i, t in enumerate(toks):
 if os.uname().machine == "arm64" and "-arch" not in toks:
     toks[1:1] = ["-arch", "x86_64"]
 toks[1:1] = ["-mmacosx-version-min=15.0", "-g0", "-ffile-prefix-map="+os.path.dirname(src)+"=driver", "-ffile-prefix-map="+os.environ["OGKM"]+"=nvidia", "-ffile-prefix-map="+os.path.expanduser("~")+"=/build", "-fdebug-prefix-map="+os.path.expanduser("~")+"=/build"]
+# RMCC_EXTRA: extra flags for a file that needs something osapi.c does not, e.g. -I<Kernel.framework/Headers> for one
+# that also includes <IOKit/IOLib.h> (nvrm_telemetry_rusd.c). Kept out of the recorded RM line itself.
+_extra = os.environ.get("RMCC_EXTRA")
+if _extra: toks[1:1] = shlex.split(_extra)
 r = subprocess.run(toks, cwd=rm, capture_output=True, text=True)
 sys.stderr.write(r.stderr[-6000:])
 sys.exit(r.returncode)

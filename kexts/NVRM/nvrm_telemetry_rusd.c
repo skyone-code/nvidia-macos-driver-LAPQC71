@@ -219,7 +219,7 @@ int nvrm_rusd_read(struct NVRMTelemetryRusd *out, unsigned long long nowNs,
             have++;
         }
         if (have) {
-            out->sensorCount = have;
+            out->sensorCount = (unsigned)have;
             got |= NVRM_RUSD_SENSORS;
         }
     }

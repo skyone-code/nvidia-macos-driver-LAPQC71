@@ -62,12 +62,21 @@ for s in "${CXX_SOURCES[@]}"; do
 done
 xcrun clang "${CFLAGS[@]}" -x c -std=gnu11 -c "$SRC/nvrm_kapi_fields.c" -o "$OUT/nvrm_kapi_fields.o" 2>"$OUT/kapi.err" || { echo "STOP: nvrm_kapi_fields.c did not compile"; head "$OUT/kapi.err"; exit 1; }
 OBJS+=("$OUT/nvrm_kapi_fields.o")
+# nvrm_telemetry_rusd.c: the RUSD half of the telemetry patch. It defines nvrm_rusd_read and nvrm_rusd_dump_stamps,
+# both called from nvrm_fbinfo.cpp. Left out of the build the kext still links -- -Xlinker -kext keeps unresolved
+# references -- and only `kmutil load -p` or kextcache's silent drop shows it, so a whole boot ends up with no NVRM and
+# no GPU driver. It includes the RM's own headers (nv.h, nv-priv.h, gpu/gpu.h) and adds <IOKit/IOLib.h> on top, so it
+# is compiled with the RM's own command line for osapi.c plus the kernel framework's include path (RMCC_EXTRA).
+RMCC_EXTRA="-I$KHDR" OGKM="$OGKM" python3 -B "$HERE/../kexts/NVRM/rmcc.py" "$SRC/nvrm_telemetry_rusd.c" "$OUT/nvrm_telemetry_rusd.o" 2>"$OUT/rusd.err" || { echo "STOP: nvrm_telemetry_rusd.c did not compile"; grep error: "$OUT/rusd.err" | head; exit 1; }
+OBJS+=("$OUT/nvrm_telemetry_rusd.o")
 # nvrm_pageoff.c includes RM-internal headers: compiled with the RM's own command line for osapi.c (rmcc.py)
 OGKM="$OGKM" python3 -B "$HERE/../kexts/NVRM/rmcc.py" "$SRC/nvrm_pageoff.c" "$OUT/nvrm_pageoff.o" 2>"$OUT/pageoff.err" || { echo "STOP: nvrm_pageoff.c did not compile"; tail "$OUT/pageoff.err"; exit 1; }
 OBJS+=("$OUT/nvrm_pageoff.o")
 # nvrm_pmgr.c (the notebook power-budget control) needs the GPU object too
 OGKM="$OGKM" python3 -B "$HERE/../kexts/NVRM/rmcc.py" "$SRC/nvrm_pmgr.c" "$OUT/nvrm_pmgr.o" 2>"$OUT/pmgr.err" || { echo "STOP: nvrm_pmgr.c did not compile"; tail "$OUT/pmgr.err"; exit 1; }
 OBJS+=("$OUT/nvrm_pmgr.o")
+# rusd.err stays out of the count: it is compiled with RM's own -Wundef line and every warning it produces comes from
+# the RM headers, not from this tree. It is still written to $OUT/rusd.err for inspection.
 bash "$HERE/warn_ceiling.sh" nvrm "$(cat "$OUT"/*.o.err "$OUT/kapi.err" "$OUT/pageoff.err" "$OUT/pmgr.err" | grep -c ': warning:')" || exit 4
 xcrun clang++ -arch x86_64 -mmacosx-version-min=15.0 -fapple-kext -nostdlib -Xlinker -kext -lkmodc++ -lkmod -lcc_kext "${OBJS[@]}" \
   "$NV/_out/Darwin_x86_64/libnvkernel.a" "$KMSLIB" -o "$OUT/NVRM.kext/Contents/MacOS/NVRM" 2>"$OUT/link.err" || { echo "STOP: link failed"; grep -v "built for newer" "$OUT/link.err" | head; exit 1; }

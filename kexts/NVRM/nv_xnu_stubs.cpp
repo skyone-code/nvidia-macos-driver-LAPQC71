@@ -12,6 +12,28 @@ extern "C" {
 
 extern "C" void nv_xnu_power_state(bool *acPlugged, bool *haveBattery);   // nv_xnu_power.cpp
 
+/*
+ * The return thunk: a no-op `ret`.
+ *
+ * libnvkms.a in the open-gpu-kernel-modules tree is compiled with -mfunction-return=thunk-extern, so every function
+ * in it returns through ___x86_return_thunk instead of emitting `ret` inline. XNU does not export that symbol to
+ * kexts, and a kext is linked with -Xlinker -kext, so the reference stays unresolved: kextcache then drops the whole
+ * bundle without a word ("Failed to bind '___x86_return_thunk' ... as could not find a kext which exports this
+ * symbol" is only visible through `kmutil load -p`), NVRM never loads, and NVAccel reports "NVRM never claimed
+ * <gpu> in 30 s - NOT starting the accelerator on a GPU with no RM" on a machine that otherwise looks fine.
+ *
+ * Supplying the thunk here is exactly what -mfunction-return=thunk-inline would have emitted at every call site:
+ * a plain return. Only the objects the linker actually pulls in matter, but defining the symbol once covers any
+ * other member that gets pulled later.
+ *
+ * MUST be naked. Compiled as a normal function clang emits `push %rbp; mov %rsp,%rbp; ret`, and the sites that
+ * jump here do so with RSP pointing at their own return address and RBP already popped: the prologue pushes the
+ * caller's frame pointer over the return address, and the ret then lands on that frame pointer - a stack address,
+ * i.e. exactly the "Kernel NX fault, RIP = stack address, uptime ~17 s" panic seen twice (11-15 09:14 and 11:45).
+ * Apple's own thunk is bare `ret; int3; int3; int3` (the int3s only catch a stray fall-through), so match it.
+ */
+extern "C" __attribute__((naked)) void __x86_return_thunk(void) { __asm__ volatile("ret; int3; int3; int3"); }
+
 extern "C" {
 
 __attribute__((weak)) NV_STATUS NV_API_CALL nv_acpi_d3cold_dsm_for_upstream_port(nv_state_t *, NvU8 *, NvU32, NvU32, NvU32 *)
