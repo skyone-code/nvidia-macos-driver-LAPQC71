@@ -1,7 +1,7 @@
 #!/bin/bash
 # Build NVK (Mesa Vulkan driver for NVIDIA + the NAK compiler) for x86_64 macOS from pristine Mesa plus the patches in nvk/.
 #
-# usage: build_nvk.sh <mesa git dir> <open-gpu-kernel-modules 610.57.04 tree> <out dir> [2.9|2.8]
+# usage: build_nvk.sh <mesa git dir> <open-gpu-kernel-modules 610.57.04 tree> <out dir> [3.1|3.0|2.9|2.8]
 #
 # The release argument selects the patch set (default 2.9):
 #   Both end with nvk/dlss/patch_dlss_cache.py.
@@ -42,12 +42,15 @@ FLOOR=${NVK_FLOOR:-15.0}
 case $REL in
   2.9) FIXES=$NVK/nvk-fixes-after-def16.patch
        CHAIN="nvk-macos @FIXES nvk-620-kernel nvk-recycle nvk-slab nvk-slabdef nvk-hubfix nvk-perf-boost-burst nvk-rated-tdp nvk-gps-maxpower nvk-metal-wsi nvk-card-select hwrt/ttu-nak hwrt/ttu-rq curves/curves hwrt/wide nvk-warnings nvk-unbound-stage nvk-diag-nofollow" ;;
+  3.1) FIXES=$NVK/nvk-fixes-after-def16.patch   # 3.0's set; 3.1 moved the Mesa base to the mesa-26.3.1 tag
+       # (nvk/MESA_BASE) and the ogkm/NVRM base to 620.73.04; the chain itself is unchanged
+       CHAIN="nvk-macos @FIXES nvk-620-kernel nvk-recycle nvk-slab nvk-slabdef nvk-hubfix nvk-perf-boost-burst nvk-rated-tdp nvk-gps-maxpower nvk-metal-wsi nvk-card-select hwrt/ttu-nak hwrt/ttu-rq curves/curves hwrt/wide nvk-warnings nvk-unbound-stage nvk-diag-nofollow nvk-stream-uncached" ;;
   3.0) FIXES=$NVK/nvk-fixes-after-def16.patch   # 2.9's set plus the uncached command stream
        CHAIN="nvk-macos @FIXES nvk-620-kernel nvk-recycle nvk-slab nvk-slabdef nvk-hubfix nvk-perf-boost-burst nvk-rated-tdp nvk-gps-maxpower nvk-metal-wsi nvk-card-select hwrt/ttu-nak hwrt/ttu-rq curves/curves hwrt/wide nvk-warnings nvk-unbound-stage nvk-diag-nofollow nvk-stream-uncached" ;;
   2.8) FIXES=$NVK/release-2.8/nvk-fixes-after-def16.patch
        BASE=17ca6174   # the 2.8 / 2.8.1 package was built on this Mesa; 2.9 moved to nvk/MESA_BASE (26.3)
        CHAIN="nvk-macos @FIXES nvk-620-kernel nvk-recycle nvk-slab nvk-slabdef" ;;
-  *) echo "STOP: release must be 3.0, 2.9 or 2.8"; exit 2 ;;
+  *) echo "STOP: release must be 3.1, 3.0, 2.9 or 2.8"; exit 2 ;;
 esac
 
 # NVK_EXTRA_PATCHES="nvk-upstream-nak" appends patch files from nvk/ to the chain (upstream NAK/NVK fixes newer than

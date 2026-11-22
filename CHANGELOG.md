@@ -1,5 +1,31 @@
 # Changelog
 
+## 3.1
+
+3.1 is the 3.0 patch set rebased onto the upgraded bases: the kernel-side ogkm moves from 620.70.06 to **620.73.04**, the
+Vulkan side moves from Mesa 26.3.0-rc3 to the **mesa-26.3.1** tag, and the GSP/ucodes firmware is aligned to the NVIDIA
+620.73.04 release (the kext's firmware directory and its SHA-1 pin set move with it; `fw_fetch.sh` carries the new pins).
+
+### Changes
+- ogkm/NVRM base 620.70.06 → 620.73.04: the kapi gains PM lock helpers (`nvkms_lock/unlock_pm_from_kapi`); the xnu side
+  answers them with no-ops (the PM window is already serialized on the xnu side), plus TDISP BAR1 semantics, FP16 FMT
+  bypass and a per-layer CSC override come with the upstream diff.
+- GSP firmware (`gsp_ga10x.bin`, `gsp_tu10x.bin`) and microcodes (`ucodes_ga10x.bin`, `ucodes_tu10x.bin`) move to the
+  620.73.04 files. Loading a 620.70.06 firmware under a 620.73.04 RM left the GPU reported to userland with SM version 0
+  and failed ESC commands — Vulkan enumerated no device until the firmware matched.
+- Mesa/NVK base 26.3.0-rc3 (90a959eb) → mesa-26.3.1 (fec8830e); the NVK patch chain applies unchanged.
+- `build_nvk.sh` grows a `3.1` release branch (same chain as 3.0).
+
+### Carried from the 3.0 line (local patch set, all on the new base)
+- Video apps (VideoToolbox reentrancy) crashing at launch: the five VideoToolbox component registrations run on the next
+  main-queue turn, so Metal's device enumeration only ever sees a complete device; every NVMTLDevice is pinned for the
+  life of the process.
+- Headless boot keeps a placeholder framebuffer and answers its VRAM range so WindowServer holds on; the device is rebuilt
+  with a fresh display enumeration when EDID is not ready yet.
+- Telemetry v3: framebuffer occupancy (VRAM used/total), PCIe link, fan, ECC, row remap, engine utilization, instant power,
+  clock table — published under the names the monitoring tools read; head hardware-state and kapi event counters as debug
+  sysctls.
+
 ## 3.0
 
 ### Fixes
