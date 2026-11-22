@@ -49,6 +49,7 @@ static inline thread_call_t nvrmfbCall(thread_call_func_t fn, thread_call_param_
 #include "nvrmfb_scanout_reserve.h"
 #include <IOKit/i2c/IOI2CInterface.h>
 #include "../nvrm_ddc_abi.h"
+#include "../../NVRM/nvrm_display_identity.h"
 #include "../nvrm_off_bar.h"
 #include "../nvrm_edp_backlight.h"
 #include "nvrm-allocation-table.h"
@@ -750,6 +751,13 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     bool fHotplugBorn = false, fConnectFired = false;
     // The connect interrupt came due before the framework had registered its handler; registerForInterruptType fires
     // it as soon as the handler arrives (see connectNotifyFire).
+    bool fHotplugStarted = false;
+    bool fStandby = false;
+    bool selectInitialMode(NvKmsKapiDisplay display, NvU64 bytes, unsigned alignment,
+                           struct NvKmsKapiDisplayMode &mode);
+    bool activateStandby();
+    bool configureControllerIdentity(IOService *provider);
+    void configureDisplayIdentity(IOService *provider);
     volatile SInt32 fConnectOwed = 0;
     bool fEdidSwapped = false;
     void adoptSwappedDisplay();
@@ -851,8 +859,8 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     volatile SInt32 fWillSleepOff = 0;
     static IOReturn sleepTap(OSObject *self, void *, IOFramebuffer *, IOIndex event, void *info);
     bool fDpyLost = false;   // the connector is disconnected; re-sense after its EDID is restored
-    // macOS pushes an all-black output LUT right after a display comes back; only that window is ignored so a
-    // deliberate fade or blackout still applies.
+    // macOS can send an all-black output LUT while a connector is coming online.
+    // After the connection settles, deliberate fades and blackouts work normally.
     UInt64 fBlackLutDeadline = 0;
     bool fRelightAudioValid = false;   // the reconnect carried a readable EDID, so cached audio may be republished
     static void eventCallback(const struct NvKmsKapiEvent *event) {
@@ -894,6 +902,11 @@ public:
     void stop(IOService *provider) override;
     using IOFramebuffer::setProperty;
     bool setProperty(const OSSymbol *key, OSObject *value) override {
+        const bool accepted = IOFramebuffer::setProperty(key, value);
+        if (accepted && fHotplugBorn && key &&
+            (key->isEqualTo("IOAccelIndex") || key->isEqualTo("IOAccelTypes"))) {
+            notifyConnectionChanged(100);
+        }
         if (key && key->isEqualTo("IOFBTransform")) {   // kIOFBTransformKey
             OSNumber *n = OSDynamicCast(OSNumber, value);
             const UInt32 v = n ? (UInt32)n->unsigned64BitValue() : 0;
@@ -1474,14 +1487,21 @@ bool NVRMNVDAFramebuffer::kapiInit()
         return true;
     }
     if (gNDpy <= 0 || fIndex >= (unsigned)gNDpy) {
-        FBLOG("index %u: only %d display(s) connected -- nothing to drive, not starting", fIndex, gNDpy);
+        // Keep one offline framebuffer in the boot controller on Tahoe.
+        // WindowServer must open it before that controller handles hot-plug.
+        fStandby = version_major >= 25 && gNDpy > 0 && gNDpy == gNDpyBoot &&
+                   fIndex == (unsigned)gNDpy && fIndex < fNumHeads;
         fSpareIndex = gNDpy > 0;
-        return false;
-    }
-    {   // Surround (nvfbsurround): read the mask once. Members start as ordinary framebuffers, hidden from WindowServer (fHidden).
-        static bool maskRead; if (!maskRead) { maskRead = true; UInt32 v = 0; if (PE_parse_boot_argn("nvfbsurround", &v, sizeof v)) gSurroundMask = gSurroundMaskOrig = v & 0xff; }
-    }
-    {
+        if (!fStandby) return false;
+        fDpyLost = true;
+        // IOGraphics can map this aperture while it is offline. This timing
+        // only sizes the allocation and is never submitted to a connector.
+        auto &t = fMode.timings;
+        t.hVisible = 3840; t.hSyncStart = 4016; t.hSyncEnd = 4104; t.hTotal = 4400;
+        t.vVisible = 2160; t.vSyncStart = 2168; t.vSyncEnd = 2178; t.vTotal = 2250;
+        t.refreshRate = 60000; t.pixelClockHz = 594000000;
+    } else {
+        fHotplugBorn = (int)fIndex >= gNDpyBoot;
         struct nvrm_dpy_rec *r = &gDpy[fIndex];
         fDisplay = r->handle; fConnector = r->connector; fInternal = r->internal; fVrrSupported = r->vrr && vrrAllowed();
         if (fInternal) FBLOG("fb%u: display 0x%x is internal -- reporting kIOConnectionBuiltIn", fIndex, fDisplay);
@@ -1504,40 +1524,19 @@ bool NVRMNVDAFramebuffer::kapiInit()
         FBLOG("index %u -> display 0x%x connector 0x%x headMask 0x%x -> head %u (taken now 0x%x)",
               fIndex, fDisplay, (unsigned)fConnector, (unsigned)r->headMask, fHead,
               (unsigned)gHeadsTaken);
+        {   // Surround (nvfbsurround): read the mask once, before the first fHidden use. Members start as ordinary framebuffers.
+            static bool maskRead; if (!maskRead) { maskRead = true; UInt32 v = 0; if (PE_parse_boot_argn("nvfbsurround", &v, sizeof v)) gSurroundMask = gSurroundMaskOrig = v & 0xff; }
+        }
         fHidden = nvrmSurroundIsMember(gSurroundMask, fIndex, (unsigned)gNDpy);
         if (fHidden) FBLOG("fb%u: member of the surround group led by index %u -- hidden from WindowServer, its head serves the group", fIndex, nvrmSurroundMaster(gSurroundMask, (unsigned)gNDpy));
     }
-    // This mode becomes the head's boot raster (fBootW/fBootH below), which decides the scaler and
-    // raster ceilings and which refresh rates addKmsRefreshModes() can publish. A NVKMS-preferred mode
-    // is the EDID native timing and wins outright. When no mode is flagged preferred -- common on a
-    // second monitor, whose head never runs the firmware's console detection -- the largest validated
-    // raster is the panel's native resolution. Taking the first validated mode instead made the boot
-    // raster depend on NVKMS enumeration order: a small raster landing first capped fRasterMaxW below
-    // the native resolution (so its high-refresh modes were never offered) and let the intermediate
-    // rasters flood the mode table, which is why a second high-refresh display came up at 60/75 Hz or
-    // black on some boots and correctly on others. Ties keep the higher pixel clock so the boot mode is
-    // the native raster's top rate.
-    bool have = false; NvU64 bestArea = 0; NvU32 bestClock = 0;
-    for (NvU32 i = 0; i < 256; i++) {
-        struct NvKmsKapiDisplayMode m = {}; NvBool valid = NV_FALSE, preferred = NV_FALSE;
-        int r = fKms->getDisplayMode(fDev, fDisplay, i, &m, &valid, &preferred);
-        if (r < 0) break;
-        if (r == 0 || !valid) continue;
-        if (!nvrmKmsRasterValid(m.timings.hVisible, m.timings.vVisible)) {
-            FBLOG("skip mode %u with raster %ux%u outside NVKMS layer range", i,
-                  m.timings.hVisible, m.timings.vVisible);
-            continue;
-        }
-        if (preferred) { fMode = m; have = true; break; }
-        const NvU64 area = (NvU64)m.timings.hVisible * m.timings.vVisible;
-        if (!have || area > bestArea || (area == bestArea && m.timings.pixelClockHz > bestClock)) {
-            fMode = m; bestArea = area; bestClock = m.timings.pixelClockHz; have = true;
-        }
+    if (!fStandby && !selectInitialMode(fDisplay, 0, pitchAlign, fMode)) {
+        FBLOG("no valid mode");
+        return false;
     }
-    if (!have) { FBLOG("no valid mode"); return false; }
     if (gBootHead < 0 && fIndex == 0) fBootConsole = true;
-    fKmsMode = fMode; fHaveKmsMode = true;
-    if (gBootHead >= 0 && fDisplay == gBootDpy && (int)fHead == gBootHead &&
+    fKmsMode = fMode; fHaveKmsMode = !fStandby;
+    if (!fStandby && gBootHead >= 0 && fDisplay == gBootDpy && (int)fHead == gBootHead &&
         nvrmKmsRasterValid(gBootMode.timings.hVisible, gBootMode.timings.vVisible)) {
         // the fallback for a refused firmware timing must be the same raster (it scans out the same surface): the
         // validated mode at the boot size whose refresh is closest to the firmware's
@@ -1558,7 +1557,7 @@ bool NVRMNVDAFramebuffer::kapiInit()
         fBootConsole = true;
         FBLOG("boot pair: display 0x%x keeps the firmware's mode %ux%u @%u on head %u", fDisplay,
               fMode.timings.hVisible, fMode.timings.vVisible, fMode.timings.refreshRate, fHead);
-    } else if (gBootHead >= 0 && fDisplay == gBootDpy && (int)fHead == gBootHead) {
+    } else if (!fStandby && gBootHead >= 0 && fDisplay == gBootDpy && (int)fHead == gBootHead) {
         fBootConsole = true;
         FBLOG("firmware boot raster %ux%u is outside the NVKMS layer range; using selected mode %ux%u",
               gBootMode.timings.hVisible, gBootMode.timings.vVisible,
@@ -1577,7 +1576,13 @@ bool NVRMNVDAFramebuffer::kapiInit()
     fSize = ((NvU64)fPitch * fH + 0xffff) & ~0xffffull;
     {
         fBootMode = fMode; fBootW = fW; fBootH = fH; fBootPitch = fPitch; fRasterW = fW; fRasterH = fH; fPitchAlign = pitchAlign;
-        computeScanoutCaps(pitchAlign);
+        if (fStandby) {
+            fScalerMaxW = fRasterMaxW = fW;
+            fScalerMaxH = fH;
+            fModesAllocSize = fAllocSize = fSize;
+        } else {
+            computeScanoutCaps(pitchAlign);
+        }
         FBLOG("fbmodes: boot raster %ux%u pitch %u; scanout allocation sized for %ux%u (%llu KB, boot needs %llu KB)",
               fW, fH, fPitch, fScalerMaxW, fScalerMaxH, fAllocSize / 1024, fSize / 1024);
     }
@@ -1605,7 +1610,7 @@ bool NVRMNVDAFramebuffer::kapiInit()
     int apertureRounds = 0;
     bool haveAperture = false;
     struct { struct NvKmsKapiMemory *m; void *k; void *u; } parked[8]; int nParked = 0;
-    for (int round = 0; round < 10 && !haveAperture; round++) {
+    for (int round = 0; round < (fStandby ? 1 : 10) && !haveAperture; round++) {
      apertureRounds = round;
      if (round) {
         FBLOG("aperture retry round %d: BAR1 not CPU-writable yet -- waiting 5 s, then rolling again", round);
@@ -1703,8 +1708,10 @@ bool NVRMNVDAFramebuffer::kapiInit()
         if (consoleSilenced && getPlatform()) getPlatform()->setConsoleInfo(0, kPEEnableScreen);
         return false;
     }
-    publishTimingCaps();
-    publishStartupTiming();
+    if (!fStandby) {
+        publishTimingCaps();
+        publishStartupTiming();
+    }
     struct NvKmsKapiCreateSurfaceParams sp = {};
     sp.planes[0].memory = fMem; sp.planes[0].offset = 0; sp.planes[0].pitch = fPitch;
     sp.width = fW; sp.height = fH; sp.format = NvKmsSurfaceMemoryFormatX8R8G8B8;
@@ -1840,6 +1847,32 @@ bool NVRMNVDAFramebuffer::kapiInit()
 }
 
 
+bool NVRMNVDAFramebuffer::selectInitialMode(NvKmsKapiDisplay display, NvU64 bytes, unsigned alignment,
+                                           struct NvKmsKapiDisplayMode &mode)
+{
+    // Prefer the native timing, then the largest validated raster and rate.
+    bool have = false; NvU64 bestArea = 0; NvU32 bestClock = 0;
+    for (NvU32 i = 0; i < 256; i++) {
+        struct NvKmsKapiDisplayMode m = {}; NvBool valid = NV_FALSE, preferred = NV_FALSE;
+        int r = fKms->getDisplayMode(fDev, display, i, &m, &valid, &preferred);
+        if (r < 0) break;
+        if (r == 0 || !valid) continue;
+        if (!nvrmKmsRasterValid(m.timings.hVisible, m.timings.vVisible)) {
+            FBLOG("skip mode %u with raster %ux%u outside NVKMS layer range", i,
+                  m.timings.hVisible, m.timings.vVisible);
+            continue;
+        }
+        if (bytes && !nvrmfb_scanout_fits(m.timings.hVisible, m.timings.vVisible, alignment, bytes))
+            continue;
+        if (preferred) { mode = m; have = true; break; }
+        const NvU64 area = (NvU64)m.timings.hVisible * m.timings.vVisible;
+        if (!have || area > bestArea || (area == bestArea && m.timings.pixelClockHz > bestClock)) {
+            mode = m; bestArea = area; bestClock = m.timings.pixelClockHz; have = true;
+        }
+    }
+    return have;
+}
+
 static NVRMNVDAFramebuffer *gFB = nullptr;
 // Every started framebuffer, so hot-plug can find the one driving a display that went away and came back.
 static NVRMNVDAFramebuffer *gFBs[16];
@@ -1866,6 +1899,32 @@ void NVRMNVDAFramebuffer::connectNotifyFire(thread_call_param_t p0, thread_call_
     if (!me) return;
     NVRMCallReference callReference(me);
     if (OSAddAtomic(0, &me->fStopping)) return;
+    if (!me->fConnect.proc && me->fHotplugBorn && !me->fEnableAbs &&
+        __atomic_load_n(&me->fHotplugStarted, __ATOMIC_ACQUIRE) && !me->fDpyLost &&
+        me->getProperty("IOAccelIndex") && me->getProperty("IOAccelTypes")) {
+        // Running WindowServer may not open a new framebuffer. Initialize
+        // the graphics family after its accelerator publishes the binding.
+        // The server still creates and owns its normal user client.
+        const IOReturn result = me->IOFramebuffer::open();
+        FBLOG("fb%u: opening late framebuffer through IOGraphics -> 0x%x", me->fIndex, result);
+        if (result == kIOReturnSuccess && me->fConnect.proc) {
+            NVRMNVDAFramebuffer *primary = nullptr;
+            {
+                NVRMDisplayGate gate;
+                if (gate.valid() && gFBs[0] && gFBs[0] != me) {
+                    primary = gFBs[0];
+                    primary->retain();
+                }
+            }
+            if (primary) {
+                primary->notifyConnectionChanged(100);
+                primary->release();
+            }
+            // enableController scheduled this framebuffer's notification
+            // before open() installed the connect handler.
+            return;
+        }
+    }
     // v12.6 parity (one delivery per connection episode): the bring-up chain and enableController can both
     // schedule this; after the first delivery a second interrupt only makes the framework re-probe a display
     // it already took. New episodes (adopt, loss, return, swap) re-arm the flag at their own sites.
@@ -2004,6 +2063,16 @@ void NVRMNVDAFramebuffer::takeEdid(const NvU8 *src, NvU32 size)
 {
     fEdidSize = (NvU16)(size > sizeof fEdid ? sizeof fEdid : size);
     nvu_copy(fEdid, src, fEdidSize);
+    // The physical sink is identifiable before IOGraphics opens an
+    // AppleDisplay and independently of an AppleHDA association.
+    const NvU8 header[] = {0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00};
+    if (fEdidSize >= 128 && memcmp(fEdid, header, sizeof header) == 0) {
+        const NvU32 vendor = (NvU32(fEdid[8]) << 8) | fEdid[9];
+        const NvU32 product = (NvU32(fEdid[11]) << 8) | fEdid[10];
+        setProperty("NVRMDisplayEDIDIdentity", (unsigned long long)((vendor << 16) | product), 32);
+    } else {
+        removeProperty("NVRMDisplayEDIDIdentity");
+    }
     nvrmEdidPanelSizeMm(fEdid, fEdidSize, &fEdidMmW, &fEdidMmH);
     if (!nvrmEdidVerticalRange(fEdid, fEdidSize, &fVrrMinHz, &fVrrMaxHz)) fVrrMinHz = fVrrMaxHz = 0;
     fHdrCapable = nvrmEdidHdrPq(fEdid, fEdidSize, &fHdrMaxLumCode);
@@ -2327,6 +2396,7 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
                         FBLOG("hot-plug: display 0x%x went away (fb %u)", handles[i], fb->fIndex);
                         fb->fDpyLost = true;
                         fb->fEdidSize = 0;
+                        fb->removeProperty("NVRMDisplayEDIDIdentity");
                         fb->clearDisplayAudioProperties();
                         fb->fConnectFired = false;   // re-arm: the return is a fresh connection episode (v12.6)
                         if (nnotify < sizeof notify / sizeof notify[0]) { fb->retain(); notify[nnotify++] = fb; }
@@ -2376,15 +2446,29 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
                   gDpy[k].handle, fb->fIndex);
             fb->fDpyLost = true;
             fb->fEdidSize = 0;
+            fb->removeProperty("NVRMDisplayEDIDIdentity");
             fb->clearDisplayAudioProperties();
             fb->fConnectFired = false;   // re-arm: the return is a fresh connection episode (v12.6)
             if (nnotify < sizeof notify / sizeof notify[0]) { fb->retain(); notify[nnotify++] = fb; }
         }
     }
-    for (unsigned i = 0; i < sizeof gFBs / sizeof gFBs[0]; ++i)
-        if (gFBs[i] && !gFBs[i]->fDpyLost) gFBs[i]->publishDisplayAudioProperties();
+    NVRMNVDAFramebuffer *standby = nullptr;
+    for (unsigned i = 0; i < sizeof gFBs / sizeof gFBs[0]; ++i) {
+        auto *fb = gFBs[i];
+        if (!fb) continue;
+        if (!fb->fDpyLost) fb->publishDisplayAudioProperties();
+        else if (fb->fStandby && i < (unsigned)gNDpy && gDpy[i].connected &&
+                 __atomic_load_n(&fb->fHotplugStarted, __ATOMIC_ACQUIRE)) {
+            standby = fb;
+            standby->retain();
+        }
+    }
     if (sl) IORecursiveLockUnlock(sl);
     IOFree(dd, sizeof *dd);
+    if (standby) {
+        if (standby->activateStandby()) standby->notifyConnectionChanged(100);
+        standby->release();
+    }
     for (unsigned f = 0; f < nnotify; f++) {
         notify[f]->notifyConnectionChanged(500);
         notify[f]->release();
@@ -2437,6 +2521,67 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
     }
     FBLOG("hot-plug: %d display(s) added, %u idle nub(s) matched again", added, matched);
 }
+bool NVRMNVDAFramebuffer::activateStandby()
+{
+    NVRMDisplayGate gate;
+    if (!gate.valid() || !fStandby || fSubmissionFaulted || OSAddAtomic(0, &fStopping) ||
+        fIndex >= (unsigned)gNDpy || !rmGpuReady()) return false;
+    const auto &sink = gDpy[fIndex];
+    if (!sink.connected) return false;
+    const NvU32 available = sink.headMask & ~gHeadsTaken;
+    NvKmsKapiDisplayMode mode = {};
+    if (!available || !selectInitialMode(sink.handle, fMemBytes, fPitchAlign, mode)) {
+        FBLOG("fb%u: standby has no compatible head or scanout mode", fIndex);
+        return false;
+    }
+
+    fHead = (NvU32)__builtin_ctz(available);
+    gHeadsTaken |= 1u << fHead;
+    fOwnsHead = true;
+    fDisplay = sink.handle;
+    fConnector = sink.connector;
+    const IOReturn result = switchMode(kModeId, mode, mode.timings.hVisible, mode.timings.vVisible, 0);
+    if (result != kIOReturnSuccess) {
+        // A rejected transaction hasn't bound the head. An accepted
+        // transaction with a lost completion keeps its surfaces pinned.
+        if (!fSubmissionFaulted) {
+            gHeadsTaken &= ~(1u << fHead);
+            fOwnsHead = false;
+            fDisplay = 0;
+            fConnector = 0;
+        }
+        FBLOG("fb%u: standby modeset failed (0x%x)", fIndex, result);
+        return false;
+    }
+
+    fBootMode = fMode;
+    fBootW = fW; fBootH = fH; fBootPitch = fPitch;
+    fKmsMode = fMode; fHaveKmsMode = true;
+    fBootInDT = false; fNDT = 0;
+    fInternal = sink.internal;
+    const NvU64 reserved = fAllocSize;
+    computeScanoutCaps(fPitchAlign);
+    fAllocSize = reserved;
+    if (!nvrmfb_scanout_fits(fScalerMaxW, fScalerMaxH, fPitchAlign, fMemBytes)) {
+        fRasterMaxW = fScalerMaxW = fW;
+        fScalerMaxH = fH;
+        fModesAllocSize = reserved;
+    }
+    // The standby framebuffer is about to become visible to WindowServer.
+    clock_interval_to_deadline(15000, kMillisecondScale, &fBlackLutDeadline);
+    takeEdid(sink.edid, sink.edidSize);
+    {
+        NVRMDisplayGate sinkGate(fDdcSinkLock);
+        fDpyLost = false;
+    }
+    fStandby = false;
+    publishTimingCaps();
+    publishStartupTiming();
+    publishDisplayAudioProperties();
+    FBLOG("fb%u: standby online: display 0x%x, head %u, %ux%u", fIndex, fDisplay, fHead, fW, fH);
+    return true;
+}
+
 static char gTrace[32768]; static volatile SInt32 gTraceLen = 0, gTraceN = 0, gTraceFull = 0;
 // The trace was published as the registry property "NVRMTrace" on every log line. Registry properties
 // carry no privilege, so `ioreg` handed any process the whole 32 KB - including the pointers logged in
@@ -2897,12 +3042,11 @@ IOReturn NVRMNVDAFramebuffer::nvrmSetGamma(UInt32 channels, UInt32 count, UInt32
         FBLOG("gamma: refused a table (%u channels, %u entries, %u bits)", channels, count, width);
         return kIOReturnBadArgument;
     }
-    if (nvrmLutIsBlack(channels, count, width, data) && fBlackLutDeadline &&
-        mach_absolute_time() < fBlackLutDeadline) {
-        FBLOG("gamma: all-black table ignored after a reconnect (previous LUT kept)");
+    const bool black = nvrmLutIsBlack(channels, count, width, data);
+    if (black && (fStandby || (fBlackLutDeadline && mach_absolute_time() < fBlackLutDeadline))) {
+        FBLOG("fb%u: gamma: all-black table ignored while connecting (standby %u)", fIndex, (unsigned)fStandby);
         return kIOReturnSuccess;
     }
-    fBlackLutDeadline = 0;
     if (!fGamma) {
         fGamma = (struct NvKmsLutRamps *)IOMalloc(sizeof *fGamma);
         if (!fGamma) return kIOReturnNoMemory;
@@ -2945,8 +3089,8 @@ IOReturn NVRMNVDAFramebuffer::nvrmSetGamma(UInt32 channels, UInt32 count, UInt32
     const NvBool ok = submitConfig(cfg, rep, NV_TRUE, false, true);
     if (ok) fGammaCommits++; else fGammaFails++;
     if (fGammaCommits + fGammaFails <= 3 || !ok)
-        FBLOGV("gamma: %u-channel %u x %u-bit table on head %u -> %s (flipResult %d; %u applied, %u failed)", channels, count,
-              width, fHead, ok ? "applied" : "NOT applied, previous LUT kept", (int)rep->flipResult, fGammaCommits, fGammaFails);
+        FBLOGV("gamma: %u-channel %u x %u-bit %s table on head %u -> %s (flipResult %d; %u applied, %u failed)", channels, count,
+              width, black ? "all-black" : "nonblack", fHead, ok ? "applied" : "NOT applied, previous LUT kept", (int)rep->flipResult, fGammaCommits, fGammaFails);
     IOFree(cfg, sizeof *cfg); IOFree(rep, sizeof *rep);
     return kIOReturnSuccess;
 }
@@ -3309,7 +3453,10 @@ void NVRMNVDAFramebuffer::vblFire(thread_call_param_t p0, thread_call_param_t)
     // A new mode set starts the tries over.
     me->fVblTicks++;
     if (me->fModeSetTicks == 0) me->fHwVblTries = 0;
-    if (me->fHwVblWanted && !me->fHwVblCb && (sFlipLatched[me->fHead] > 0 || me->fModeSetTicks >= 60) &&
+    // A published standby starts with head 0 as an unbound placeholder.
+    // Require its own committed mode before using another head's latch count.
+    if (!me->fStandby && me->fOwnsHead && me->fModeSet && !me->fDpyLost &&
+        me->fHwVblWanted && !me->fHwVblCb && (sFlipLatched[me->fHead] > 0 || me->fModeSetTicks >= 60) &&
         (me->fHwVblTries == 0 || hwVblRetryDue(me->fHwVblTries, me->fVblTicks - me->fHwVblTickAtTry))) {
         me->fHwVblTries++; me->fHwVblTickAtTry = me->fVblTicks;
         me->fHwVblCb = me->fKms->registerVblankIntrCallback(me->fDev, me->fHead, hwVblIntr, (NvU64)(uintptr_t)me);
@@ -3381,6 +3528,7 @@ void NVRMNVDAFramebuffer::headProbeFire(thread_call_param_t p0, thread_call_para
 }
 bool NVRMNVDAFramebuffer::applyMode()
 {
+    if (fStandby) return false;
     NVRMDisplayGate gate; if (!gate.valid()) return false;
     if (fConsoleAperture) {
         FBLOG("applyMode: skipped (console aperture mode -- the GOP drives this panel)");
@@ -3499,6 +3647,7 @@ bool NVRMNVDAFramebuffer::start(IOService *provider)
     fKms = (struct NvKmsKapiFunctionsTable *)displayPtrs.kapi;
     fGpuId = (NvU32)propU64(provider, "gpu-id");
     fIndex = (unsigned)propU64(provider, "fb-index");
+    configureDisplayIdentity(provider);
     fConnectNotify = nvrmfbCall(connectNotifyFire, this);
     if (!fConnectNotify) { FBLOG("fb%u: connect notification allocation failed -- refusing to start", fIndex); return false; }
     nvrmDiscoverBar1(provider, &fBarLen, &fBar1Base);
@@ -3547,7 +3696,8 @@ bool NVRMNVDAFramebuffer::start(IOService *provider)
     setProperty("IOFBMemorySize", (unsigned long long)(8ull << 30), 64);
     IORecursiveLock *sl = startLock();
     if (!sl) { FBLOG("start lock alloc failed -- refusing to start"); return false; }
-    IORecursiveLockLock(sl); bool kapiOk = kapiInit();
+    IORecursiveLockLock(sl);
+    const bool kapiOk = kapiInit() && configureControllerIdentity(provider);
     if (!kapiOk && fOwnsHead) { gHeadsTaken &= ~(1u << fHead); fOwnsHead = false; }
     IORecursiveLockUnlock(sl);
     if (!kapiOk) {
@@ -3649,6 +3799,15 @@ bool NVRMNVDAFramebuffer::start(IOService *provider)
     FBLOG("registerPowerDriver(2 states) done");
     FBLOG("started on %s", provider->getName());
     fbGuardCleared("the framebuffer has its scanout memory and a display mode");
+    if (fStandby || fHotplugBorn) {
+        __atomic_store_n(&fHotplugStarted, true, __ATOMIC_RELEASE);
+        if (fStandby) {
+            FBLOG("fb%u: published as an offline boot framebuffer", fIndex);
+            hotplugKick();
+        } else {
+            notifyConnectionChanged(100);
+        }
+    }
     return true;
 }
 void NVRMNVDAFramebuffer::scheduleCall(thread_call_t call, uint64_t deadline)
@@ -3842,6 +4001,7 @@ IOReturn NVRMNVDAFramebuffer::enableController()
     // whose enableController failed as dead for good and WindowServer's IOServiceOpen on it then fails.
     if (fPhantom) { FBLOG("enableController: placeholder, no display to enable"); return kIOReturnSuccess; }
     fEnableAbs = mach_absolute_time();
+    if (fDpyLost) return kIOReturnSuccess;
     const bool ok = applyMode();
     // A failed boot mode set must not fail the open. IOFramebuffer::open() marks a framebuffer whose enableController
     // failed as dead for good, WindowServer's IOServiceOpen on it fails (xnu reports the masked error as
@@ -3861,8 +4021,35 @@ IOReturn NVRMNVDAFramebuffer::enableController()
     }
     return kIOReturnSuccess;
 }
+void NVRMNVDAFramebuffer::configureDisplayIdentity(IOService *provider)
+{
+    // Different heads must round-trip through different IOService paths.
+    char location[9];
+    snprintf(location, sizeof location, "%x", fIndex);
+    provider->setLocation(location, gIOServicePlane);
+}
+bool NVRMNVDAFramebuffer::configureControllerIdentity(IOService *provider)
+{
+    // A secondary framebuffer created after boot cannot join the controller
+    // that IOGraphics already opened. Give it a new controller from its first
+    // publication while keeping its original accelerator slot.
+    const bool independent = fHotplugBorn && fIndex != 0;
+    // Keep head zero's existing group for the optional NMIntelFB panel. Other
+    // NVIDIA heads get their own group before IOFramebuffer caches a controller.
+    const unsigned long long group = independent
+        ? provider->getRegistryEntryID() : NVRM_LEGACY_CONTROLLER_ID;
+    const unsigned local = independent ? 0 : fIndex;
+    if (!group || !setProperty(NVRM_DISPLAY_INDEX_KEY, (unsigned long long)fIndex, 32) ||
+        !setProperty("IOFBDependentID", group, 64) ||
+        !setProperty("IOFBDependentIndex", (unsigned long long)local, 32)) return false;
+    setProperty("NVRMDisplayIdentityVersion", (unsigned long long)NVRM_DISPLAY_IDENTITY_VERSION, 32);
+    FBLOG("fb%u: controller group 0x%llx local index %u, driver slot %u (independent %u)",
+          fIndex, group, local, fIndex, (unsigned)independent);
+    return true;
+}
 IOReturn NVRMNVDAFramebuffer::setDisplayMode(IODisplayModeID mode, IOIndex depth)
 {
+    if (fStandby) return kIOReturnOffline;
     FBLOG("fb%u setDisplayMode 0x%x depth %d (current 0x%x)", fIndex, (unsigned)mode, (int)depth, (unsigned)fCurId);
     if (fProxy) return (mode == kModeId && depth == 0) ? kIOReturnSuccess : kIOReturnUnsupportedMode;
     if (fPhantom) return kIOReturnUnsupportedMode;   // no display: nothing to switch
@@ -5350,6 +5537,7 @@ IOReturn NVRMNVDAFramebuffer::callPlatformFunction(const OSSymbol *functionName,
 bool NVRMNVDAFramebuffer::flipToMemory(struct NvKmsKapiMemory *mem, unsigned w, unsigned h,
                                    unsigned pitch, int *rcOut, bool pure, UInt64 cookie)
 {
+    if (fStandby) return false;
     NVRMDisplayGate gate; if (!gate.valid() || fSubmissionFaulted) return false;
     if (mem) {
         const UInt64 bytes = gAllocations.size(mem, cookie);
