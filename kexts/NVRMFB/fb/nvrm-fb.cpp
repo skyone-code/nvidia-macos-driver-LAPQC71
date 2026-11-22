@@ -3821,6 +3821,10 @@ void NVRMNVDAFramebuffer::scheduleCall(thread_call_t call, uint64_t deadline)
 }
 void NVRMNVDAFramebuffer::stop(IOService *provider)
 {
+    // The instance is going away: uncount its BAR1 display mapping. The memory itself is freed
+    // with the NvKMS device, so the counter must not outlive the framebuffer that mapped it.
+    if (fScanoutBarBytes) { OSAddAtomic64(-(SInt64)fScanoutBarBytes, &gVramDisplayBytes); fScanoutBarBytes = 0; }
+    if (fCursorBarBytes) { OSAddAtomic64(-(SInt64)fCursorBarBytes, &gVramDisplayBytes); fCursorBarBytes = 0; }
     if (fAudioReady) { fAudioReady->remove(); fAudioReady = nullptr; }
     if (fCodecReady) { fCodecReady->remove(); fCodecReady = nullptr; }
     if (fFlipCacheLock) {
