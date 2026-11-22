@@ -1825,6 +1825,14 @@ static bool nvAccelFlatHeld(NVDisplayPipe *pipe, unsigned head, IOSurface *s);
 static struct nmh_shadow *nvAccelHybridShadow(unsigned head, unsigned w, unsigned h);
 static void nvAccelHybridHome(IOService *fb, unsigned head);
 static void nvAccelIopHome(IOService *fb, unsigned head);
+static int    gIopBars;        // debug.nvaccel_bars
+static SInt64 gCntIopBars;     // transactions that painted a strip
+// Read-back of the scanout destination (debug.nvaccel_dst_hash / _dst_nz / _src_hash / _src_nz). These are sampled
+// from the memory the framebuffer itself told us to fill, so they do not depend on what NVKMS believes the head is
+// reading -- the CRC counters do. Comparing them is how "our writes never land there" is told apart from "the head
+// reads another surface".
+static int    gDstHash, gDstNz, gSrcHash, gSrcNz;
+static SInt64 gCntDstSamples;  // transactions that sampled the destination after the copy
 IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
 {
     if (!gNvIop) return (IOReturn)0xe00002c7;
@@ -1941,6 +1949,35 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
         volatile unsigned int *dp = d + (unsigned long)y * dpr;
         (void)nv_iop_convert_row(dp, sp, w, srcFmt, dst30);
     }
+    }
+    // debug.nvaccel_bars: prove that the destination described by the framebuffer is the memory the head scans. The
+    // strip is painted after the copy -- the last write before the flip -- on every 8th transaction, and its colour
+    // order rotates each time so a live strip visibly moves. A strip on the panel means these writes reach the
+    // display; no strip means the copy lands elsewhere no matter what the counters say.
+    if (gIopBars) {
+        const SInt64 nb = OSAddAtomic64(1, &gCntIopBars);
+        if ((nb & 7) == 0) nv_iop_paint_bars(d, dpr, w, h, dst30, 40u, (unsigned)((nb >> 3) & 7u));
+    }
+    // Sample the destination straight after the copy, in the same 8x8 grid the source sampling below uses. src_hash
+    // moving while dst_hash does not means the copy is not landing in the memory we were handed; dst_hash moving
+    // while the compositor CRC stays put means the head is scanning some other surface.
+    {
+        unsigned nzd = 0, nzs = 0, hd = 2166136261u, hs = 2166136261u;
+        for (unsigned bi = 0; bi < 8; bi++) for (unsigned bj = 0; bj < 8; bj++) {
+            unsigned sx = (w * (2 * bj + 1)) / 16;
+            const unsigned sy = (h * (2 * bi + 1)) / 16;
+            unsigned dxx = sx; if (dxx >= dpr) dxx = dpr - 1;
+            unsigned sxx = sx; if (sxx >= spr) sxx = spr - 1;
+            const unsigned vd = d[(unsigned long)sy * dpr + dxx] & 0xffffffu;
+            const unsigned vs = src[(unsigned long)sy * spr + sxx] & 0xffffffu;
+            if (vd) nzd++;
+            if (vs) nzs++;
+            hd = (hd ^ vd) * 16777619u;
+            hs = (hs ^ vs) * 16777619u;
+        }
+        gDstHash = (int)hd; gDstNz = (int)nzd;
+        gSrcHash = (int)hs; gSrcNz = (int)nzs;
+        OSAddAtomic64(1, &gCntDstSamples);
     }
     (void)bppSrc;
     if (dst30) OSAddAtomic64(1, &gCntIop30);
@@ -2187,11 +2224,37 @@ NVACCEL_CNT(nvaccel_iop_async_refused, gCntIopAsyncRefused, "async swaps NVKMS r
 NVACCEL_CNT(nvaccel_iop_async_drop,    gCntIopAsyncDrop,    "frames dropped because a flip was still in flight past a refresh period");
 static SInt64 gCntIopLate;
 NVACCEL_CNT(nvaccel_iop_late,          gCntIopLate,         "frames kept on the panel because the previous flip had not reached it yet (framebuffer answered busy)");
+// debug.nvaccel_bars: paint a colour strip into the scanout destination from inside the copy transaction. This is the
+// one measurement the CRC counters cannot make -- they read what NVKMS believes the head is reading, this shows what
+// the panel is actually being fed. Non-zero = on.
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_bars, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopBars, 0,
+           "1 = paint a colour strip into the scanout destination every 8th copy: visible on the panel means the accelerator's writes reach the head that scans");
+NVACCEL_CNT(nvaccel_bars_paints, gCntIopBars, "colour strips painted into the scanout destination");
+// The read-back pair. Sampled from the destination itself, so unlike the CRC counters these cannot be explaining away
+// by "NVKMS thinks". Run the same scene twice (booted with a panel vs booted headless then hot-plugged) and diff them.
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_dst_hash, CTLFLAG_RD | CTLFLAG_LOCKED, &gDstHash, 0,
+           "scanout-readback: 64-point hash of the destination right after the copy (what our writes actually left there)");
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_dst_nz, CTLFLAG_RD | CTLFLAG_LOCKED, &gDstNz, 0,
+           "scanout-readback: nonzero samples out of 64 in the destination right after the copy");
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_src_hash, CTLFLAG_RD | CTLFLAG_LOCKED, &gSrcHash, 0,
+           "scanout-readback: 64-point hash of the source surface for the same transaction");
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_src_nz, CTLFLAG_RD | CTLFLAG_LOCKED, &gSrcNz, 0,
+           "scanout-readback: nonzero samples out of 64 in the source surface");
+NVACCEL_CNT(nvaccel_dst_samples, gCntDstSamples, "transactions that sampled the scanout destination after the copy");
 static int gCrcHead = 0;
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_crc_head, CTLFLAG_RW | CTLFLAG_LOCKED, &gCrcHead, 0, "b85k-crc: which head debug.nvaccel_crc reads");
 static int nvaccel_crc_sysctl SYSCTL_HANDLER_ARGS;
 SYSCTL_PROC(_debug, OID_AUTO, nvaccel_crc, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, nvaccel_crc_sysctl, "I",
             "b85k-crc: display CRC32 of what head nvaccel_crc_head is showing (0 = unavailable)");
+static int nvaccel_crccomp_sysctl SYSCTL_HANDLER_ARGS;
+SYSCTL_PROC(_debug, OID_AUTO, nvaccel_crc_comp, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, nvaccel_crccomp_sysctl, "I",
+            "b85k-crc: compositor CRC32 only == the surface the head reads from memory (0 = unsupported)");
+static int nvaccel_crcout_sysctl SYSCTL_HANDLER_ARGS;
+SYSCTL_PROC(_debug, OID_AUTO, nvaccel_crc_out, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, nvaccel_crcout_sysctl, "I",
+            "b85k-crc: output/SOR CRC32 only == what the encoder actually sends down the link (0 = unsupported)");
+static int nvaccel_crcsup_sysctl SYSCTL_HANDLER_ARGS;
+SYSCTL_PROC(_debug, OID_AUTO, nvaccel_crc_sup, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, nvaccel_crcsup_sysctl, "I",
+            "b85k-crc: bitmask of CRC sources this head supports (1 compositor, 2 output, 4 query failed)");
 static bool gSysctlInstalled = false;
 static void nvaccelInstallSysctl(void)
 {
@@ -2230,6 +2293,8 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_unwritten); sysctl_register_oid(&sysctl__debug_nvaccel_iop_copy_unwritten);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_refused);
     sysctl_register_oid(&sysctl__debug_nvaccel_crc_head);       sysctl_register_oid(&sysctl__debug_nvaccel_crc);
+    sysctl_register_oid(&sysctl__debug_nvaccel_crc_comp);       sysctl_register_oid(&sysctl__debug_nvaccel_crc_out);
+    sysctl_register_oid(&sysctl__debug_nvaccel_crc_sup);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_hit);   sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_miss);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_async);      sysctl_register_oid(&sysctl__debug_nvaccel_iop_async_flips);
     { extern struct sysctl_oid sysctl__debug_nvaccel_svdiag; sysctl_register_oid(&sysctl__debug_nvaccel_svdiag); }
@@ -2239,8 +2304,11 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvaccel_pageoff_unlocked_wait); sysctl_register_oid(&sysctl__debug_nvaccel_pageoff_unlocked_waits);
     sysctl_register_oid(&sysctl__debug_nvaccel_pageoff_locked_not_owner); sysctl_register_oid(&sysctl__debug_nvaccel_pageoff_unlocked_wait_max_us);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_async_refused); sysctl_register_oid(&sysctl__debug_nvaccel_iop_async_drop);
-    sysctl_register_oid(&sysctl__debug_nvaccel_iop_late);
-    sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok_h0);      sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok_h1);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_late);    sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok_h0);      sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok_h1);
+    sysctl_register_oid(&sysctl__debug_nvaccel_bars);        sysctl_register_oid(&sysctl__debug_nvaccel_bars_paints);
+    sysctl_register_oid(&sysctl__debug_nvaccel_dst_hash);    sysctl_register_oid(&sysctl__debug_nvaccel_dst_nz);
+    sysctl_register_oid(&sysctl__debug_nvaccel_src_hash);    sysctl_register_oid(&sysctl__debug_nvaccel_src_nz);
+    sysctl_register_oid(&sysctl__debug_nvaccel_dst_samples);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok_h2);      sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok_h3);
     { int lv = 0; const int present = PE_parse_boot_argn("nmhybrid", &lv, sizeof lv);
       gNmHybrid = nmh_level_parse(present, lv);
@@ -2273,7 +2341,6 @@ static unsigned nvRmHandlesLogged;
 static bool nvAccelRmHandles(NVAccel *owner, struct NVRMRmHandles *out)
 {
     NVAccel *a = NVAccel::resolve(owner);
-    if (a && a->fRmHandlesValid) { *out = a->fRmHandles; return true; }
     if (!a) {
         if (nvRmHandlesLogged < 8) { nvRmHandlesLogged++;
             ALOG("nvAccelRmHandles: no NVAccel instance yet -- too early"); }
@@ -2296,14 +2363,22 @@ static bool nvAccelRmHandles(NVAccel *owner, struct NVRMRmHandles *out)
     IOReturn r = a->fFB->callPlatformFunction(sym, false, &h, nullptr, nullptr, nullptr);
     sym->release();
     if (r != kIOReturnSuccess || !h.kapiDevice) {
+        // The framebuffer rebuilds its NVKMS device when the first display appears (nvfbredev): the handle we cached
+        // before that is a freed device, so drop the cache instead of handing it out again.
+        a->fRmHandlesValid = false;
         if (nvRmHandlesLogged < 8) { nvRmHandlesLogged++;
             ALOG("nvAccelRmHandles: framebuffer gave no kapi device (ret 0x%x, kapiDevice %p)",
                  (unsigned)r, h.kapiDevice); }
         return false;
     }
+    if (a->fRmHandlesValid && a->fRmHandles.kapiDevice != h.kapiDevice)
+        ALOG("RM handles: the framebuffer rebuilt its NVKMS device (%p -> %p) -- the old handle is dead, using the new one",
+             a->fRmHandles.kapiDevice, h.kapiDevice);
     a->fRmHandles = h; a->fRmHandlesValid = true;
-    ALOG("RM handles: kapiDevice %p (hClient/hDevice resolved inside NVRM by name) "
-         "*** the accelerator can now build GPU page tables ***", h.kapiDevice);
+    static unsigned nvRmHandlesAnnounced;
+    if (nvRmHandlesAnnounced++ < 2)
+        ALOG("RM handles: kapiDevice %p (hClient/hDevice resolved inside NVRM by name) "
+             "*** the accelerator can now build GPU page tables ***", h.kapiDevice);
     *out = h;
     return true;
 }
@@ -2965,9 +3040,11 @@ static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pip
              (long long)n + 1, head, s->getSurfaceID(), W, H, P, f.flipResult);
     return true;
 }
-static int nvaccel_crc_sysctl SYSCTL_HANDLER_ARGS
+// Reads both CRC sources for gCrcHead. Returns false when the query itself failed, so a handler can tell
+// "this head has no output" apart from "the driver could not ask".
+static bool nvaccelReadCrcs(struct NvKmsKapiCrcs *c)
 {
-    unsigned v = 0;
+    nvSVZero(c, sizeof *c);
     NVAccel *a = NVAccel::forDisplay();
     IOService *fb = a ? a->fFB : nullptr;
     IOService *nub = fb ? fb->getProvider() : nullptr;
@@ -2979,10 +3056,43 @@ static int nvaccel_crc_sysctl SYSCTL_HANDLER_ARGS
     }
     struct NvKmsKapiFunctionsTable *k = (struct NvKmsKapiFunctionsTable *)displayPtrs.kapi;
     struct NVRMRmHandles h; nvSVZero(&h, sizeof h);
-    if (k && k->getCRC32 && gCrcHead >= 0 && gCrcHead < 8 && nvAccelRmHandles(NVAccel::forDisplay(), &h) && h.kapiDevice) {
-        struct NvKmsKapiCrcs c; nvSVZero(&c, sizeof c);
-        if (k->getCRC32((struct NvKmsKapiDevice *)h.kapiDevice, (NvU32)gCrcHead, &c))
-            v = c.compositorCrc32.supported ? c.compositorCrc32.value : (c.outputCrc32.supported ? c.outputCrc32.value : 0);
+    if (!k || !k->getCRC32 || gCrcHead < 0 || gCrcHead >= 8) return false;
+    if (!nvAccelRmHandles(NVAccel::forDisplay(), &h) || !h.kapiDevice) return false;
+    return k->getCRC32((struct NvKmsKapiDevice *)h.kapiDevice, (NvU32)gCrcHead, c) ? true : false;
+}
+static int nvaccel_crc_sysctl SYSCTL_HANDLER_ARGS
+{
+    unsigned v = 0;
+    struct NvKmsKapiCrcs c;
+    if (nvaccelReadCrcs(&c))
+        v = c.compositorCrc32.supported ? c.compositorCrc32.value : (c.outputCrc32.supported ? c.outputCrc32.value : 0);
+    int out = (int)v;
+    return sysctl_handle_int(oidp, &out, 0, req);
+}
+static int nvaccel_crccomp_sysctl SYSCTL_HANDLER_ARGS
+{
+    unsigned v = 0;
+    struct NvKmsKapiCrcs c;
+    if (nvaccelReadCrcs(&c) && c.compositorCrc32.supported) v = c.compositorCrc32.value;
+    int out = (int)v;
+    return sysctl_handle_int(oidp, &out, 0, req);
+}
+static int nvaccel_crcout_sysctl SYSCTL_HANDLER_ARGS
+{
+    unsigned v = 0;
+    struct NvKmsKapiCrcs c;
+    if (nvaccelReadCrcs(&c) && c.outputCrc32.supported) v = c.outputCrc32.value;
+    int out = (int)v;
+    return sysctl_handle_int(oidp, &out, 0, req);
+}
+static int nvaccel_crcsup_sysctl SYSCTL_HANDLER_ARGS
+{
+    unsigned v = 4;   // query failed unless proven otherwise
+    struct NvKmsKapiCrcs c;
+    if (nvaccelReadCrcs(&c)) {
+        v = 0;
+        if (c.compositorCrc32.supported) v |= 1;
+        if (c.outputCrc32.supported)     v |= 2;
     }
     int out = (int)v;
     return sysctl_handle_int(oidp, &out, 0, req);

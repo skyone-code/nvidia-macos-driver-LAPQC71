@@ -180,6 +180,22 @@ static inline bool nvrmPhantomEnabled()
     if (gPhantom < 0) { uint32_t g = 0; gPhantom = (PE_parse_boot_argn("nvfbphantom", &g, sizeof g) && g) ? 1 : 0; }
     return gPhantom == 1;
 }
+// nvfbredev (default 1): the boot placeholder allocates its NvKmsKapiDevice while this GPU has nothing attached.
+// NVKMS sets the display engine up per device, so that device is initialised with no connected connector. Measured on
+// the black-screen session: a mode set on it is accepted (flipResult 0), the head's input surface carries exactly the
+// pixels a healthy boot has (crc_comp identical per colour), and yet the output CRC is frozen on one black frame for
+// every mode, every surface and every gamma table tried. A boot with the display attached does the same mode set on a
+// device that saw the connector from the start. So when the first display appears, throw the placeholder's device away
+// and allocate a fresh one: that reproduces the healthy boot's device state. nvfbredev=0 keeps the old behaviour.
+static int gRedev = -1;
+static inline bool nvrmRebuildDeviceEnabled()
+{
+    if (gRedev < 0) {
+        uint32_t v = 1;
+        gRedev = (PE_parse_boot_argn("nvfbredev", &v, sizeof v) && !v) ? 0 : 1;
+    }
+    return gRedev == 1;
+}
 // Whether the offline placeholder reports a connection. Default 0: a display connect for a connector with nothing on it
 // puts a phantom entry into the framework's display set, and restoring a set that carries one cost the primary display
 // its refresh rate (#138 section 8). nvfbphantomconn=1 restores the always-connected answer.
@@ -753,6 +769,11 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     thread_call_t fConnectNotify = nullptr;
     void notifyConnectionChanged(unsigned delayMs);
     static void connectNotifyFire(thread_call_param_t p0, thread_call_param_t);
+    // v12.6 parity: the after-boot bring-up (delayed applyMode + setDisplayMode, connect interrupt only
+    // once a mode is on the head) and the retry counters it and the connect notify use.
+    thread_call_t fHotplugStart = nullptr;
+    unsigned fConnectTries = 0, fBringupTries = 0;
+    static void hotplugStartFire(thread_call_param_t p0, thread_call_param_t);
     volatile SInt32 fStopping = 0;
     void scheduleCall(thread_call_t call, uint64_t deadline);
     thread_call_t fSampler = nullptr; unsigned fSamples = 0;
@@ -1800,6 +1821,21 @@ bool NVRMNVDAFramebuffer::kapiInit()
         if (take) take->release(); if (done) done->release();
     }
     if (!painted) for (NvU64 i = 0; i < fSize / 4; i++) px[i] = 0x00000000;
+    // Diagnostics that outlive the kernel log buffer: the kernel log holds ~1000 lines and WiFi chatter rotates it
+    // within minutes, so anything needed after the fact goes in the registry instead. NVRMScanoutAlloc is what was
+    // asked of NVKMS (sized from the widest raster in the display's mode list, or from the boot raster when that list
+    // is not ready yet), NVRMScanoutNeed is what the raster in use actually needs, and the phys/kva pair is the address
+    // the accelerator copies frames into -- comparing that with the head's own base is what tells a black screen
+    // "wrong buffer" from "right buffer, nothing scanned".
+    setProperty("NVRMScanoutAlloc",   (unsigned long long)fAllocSize, 64);
+    setProperty("NVRMScanoutNeed",    (unsigned long long)fSize,      64);
+    setProperty("NVRMScanoutBytes",   (unsigned long long)fMemBytes,  64);
+    setProperty("NVRMScanoutMaxW",    (unsigned long long)fScalerMaxW, 32);
+    setProperty("NVRMScanoutMaxH",    (unsigned long long)fScalerMaxH, 32);
+    setProperty("NVRMScanoutPitch",   (unsigned long long)fPitch,      32);
+    setProperty("NVRMScanoutWH",      (unsigned long long)(((NvU64)fW << 16) | (fH & 0xffff)), 32);
+    setProperty("NVRMScanoutPhys",    (unsigned long long)fPhys,       64);
+    setProperty("NVRMScanoutKva",     (unsigned long long)(uintptr_t)fKva, 64);
     return true;
 }
 
@@ -1830,15 +1866,23 @@ void NVRMNVDAFramebuffer::connectNotifyFire(thread_call_param_t p0, thread_call_
     if (!me) return;
     NVRMCallReference callReference(me);
     if (OSAddAtomic(0, &me->fStopping)) return;
+    // v12.6 parity (one delivery per connection episode): the bring-up chain and enableController can both
+    // schedule this; after the first delivery a second interrupt only makes the framework re-probe a display
+    // it already took. New episodes (adopt, loss, return, swap) re-arm the flag at their own sites.
+    if (me->fConnectFired) return;
     if (!me->fConnect.proc) {
-        // IOFramebuffer::open registers the connect handler after enableController, and on a display plugged in after
-        // boot the open can take longer than the 1.5 s delay. Dropping the notification here left such a display dark
-        // until a restart: nothing fired it again. Owe it instead; registerForInterruptType pays it.
-        OSCompareAndSwap(0, 1, &me->fConnectOwed);
-        FBLOG("fb%u connect notify: nothing registered yet -- it fires when the framework registers its connect handler", me->fIndex);
+        // Nothing registered yet: the framework registers its connect handler when it takes the framebuffer
+        // over, which can land after this was scheduled. Retry instead of dropping the notification --
+        // a dropped one leaves the display unlisted for good (v12.6 v10).
+        me->fConnectTries++;
+        me->setProperty("NVRMConnectNoProc", (unsigned long long)me->fConnectTries, 32);
+        FBLOG("fb%u connect notify: nothing registered yet (try %u)", me->fIndex, me->fConnectTries);
+        if (me->fConnectTries <= 15) {
+            uint64_t d; clock_interval_to_deadline(2000, kMillisecondScale, &d);
+            me->scheduleCall(me->fConnectNotify, d);
+        }
         return;
     }
-    OSCompareAndSwap(1, 0, &me->fConnectOwed);
     me->fConnectFired = true;
     const int fired = (int)(OSAddAtomic(1, &sConnFires) + 1);
     me->setProperty("NVRMConnFires", (unsigned long long)fired, 32);
@@ -1849,6 +1893,7 @@ void NVRMNVDAFramebuffer::connectNotifyFire(thread_call_param_t p0, thread_call_
         // progress" (fFbs[0]->messaged, cleared only when the display stack finishes the change), and the first change
         // we fire after a boot-made placeholder is exactly the one that can be swallowed that way.
         me->fRefired = true;
+        me->fConnectFired = false;   // the deliberate anti-swallow re-fire passes the entry guard
         me->notifyConnectionChanged(6000);
     }
 }
@@ -2022,6 +2067,38 @@ bool NVRMNVDAFramebuffer::adoptFirstDisplay()
     removeProperty("NVRMPhantom");
     IORecursiveLock *sl = startLock();
     if (sl) IORecursiveLockLock(sl);
+    // The placeholder's device was allocated with nothing attached to this GPU (its own kapiInit ran at boot, found
+    // connectors but no display). NVKMS brings the display engine up per device, so that device has never seen a
+    // connected connector; every mode set on it is accepted, the head's input surface is right, and the output stays
+    // one black frame. Rebuild it now that the display is here -- see nvrmRebuildDeviceEnabled().
+    bool rebuilt = false;
+    if (gDev && fDev && nvrmRebuildDeviceEnabled()) {
+        bool sharedWithAnother = false;
+        for (unsigned i = 0; i < sizeof gFBs / sizeof gFBs[0]; i++)
+            if (gFBs[i] && gFBs[i] != this && gFBs[i]->fDev == gDev) { sharedWithAnother = true; break; }
+        if (sharedWithAnother) {
+            FBLOG("phantom fb%u: the NVKMS device is shared with another framebuffer -- keeping the display-less one "
+                  "(nvfbredev=0 would say the same)", fIndex);
+        } else {
+            struct NvKmsKapiSurface *s0 = fSurf, *s1 = fFrontSurf;
+            if (s0) fKms->destroySurface(fDev, s0);
+            if (s1 && s1 != s0) fKms->destroySurface(fDev, s1);
+            fSurf = nullptr; fFrontSurf = nullptr;
+            FBLOG("phantom fb%u: rebuilding the NVKMS device -- it was allocated with no display attached, a fresh one "
+                  "initialises the display engine with display 0x%x present (nvfbredev)", fIndex, (unsigned)gDpy[fIndex].handle);
+            fKms->releaseOwnership(fDev);
+            fKms->freeDevice(fDev);
+            fDev = nullptr; gDev = nullptr;
+            // The fresh device must run its own enumeration. hotplugFire filled gDpy from the OLD device,
+            // so gNDpy is already >= 1 here and kapiInit skips its whole `if (gNDpy < 0)` enumeration block:
+            // the new device never reads the EDID, NVKMS offers only its VESA fallback modes (the 07:13
+            // session saw exactly 3), and the head never becomes active -- activeDpys stays empty, so every
+            // flip is accepted with flipResult 0 but never submitted to EVO. That is the black screen.
+            gNDpy = -1;
+            rebuilt = true;
+            setProperty("NVRMDeviceRebuilt", (unsigned long long)1, 32);
+        }
+    }
     const bool ok = kapiInit();
     if (sl) IORecursiveLockUnlock(sl);
     if (!ok) {
@@ -2030,16 +2107,60 @@ bool NVRMNVDAFramebuffer::adoptFirstDisplay()
         FBLOG("phantom fb%u: adoption failed -- staying a placeholder until the next boot", fIndex);
         return false;
     }
+    // A rebuilt device re-ran the enumeration (gNDpy was reset above). If it still found nothing connected,
+    // the connector's EDID read has not completed yet -- proceeding would light a head NVKMS considers
+    // displayless. Hand the instance back to the placeholder state: the next hotplug scan re-adopts it,
+    // and by then the detection has had another full period to finish.
+    if (rebuilt && gNDpy <= 0) {
+        fPhantom = true; fDpyLost = true;
+        setProperty("NVRMPhantom", (unsigned long long)1, 32);
+        setProperty("NVRMRebuildEnumFailed", (unsigned long long)1, 32);
+        FBLOG("phantom fb%u: the rebuilt device enumerated %d display(s) -- EDID not ready; staying a "
+              "placeholder for the next hotplug scan", fIndex, gNDpy);
+        hotplugKick();
+        return false;
+    }
     fHotplugBorn = true;
-    const bool lit = applyMode();
-    // What the display side will see if it ever looks again: the mode count is the whole story for a framebuffer that
-    // was registered with none, so publish it next to the rest of the bring-up state.
-    const IOItemCount modes = getDisplayModeCount();
-    setProperty("NVRMModeCount", (unsigned long long)modes, 32);
-    setProperty("NVRMAdoptedLit", (unsigned long long)(lit ? 1 : 0), 32);
-    FBLOG("phantom fb%u: adopted display 0x%x on head %u %ux%u%s, %u mode(s) on offer -- telling the display stack the "
-          "connection is new", fIndex, (unsigned)fDisplay, fHead, fW, fH,
-          lit ? " (head lit)" : " (mode set refused; the display stack asks for one)", (unsigned)modes);
+    // v12.6 parity (HDMI-hotplug kit -- the 42-hunk version that shipped working): a placeholder returns
+    // from start() before its tail, and start() is the only place the vblank machinery gets armed. Without
+    // the software VBL timer IOGraphics never sees a vblank -- every flip-completion wait times out,
+    // WindowServer keeps submitting frames that never retire, and the adopted display stays black while
+    // every registry property reads healthy (black-screen session: NVRMFirstPrimaryFlipMs stayed 0, while
+    // EDID/ELD/audio/modes/OpenCount were all fine). Arm here exactly what start()'s tail arms (3305-3314).
+    if (!fVblTimer) {
+        fVblTimer = nvrmfbCall(vblFire, this);
+        if (fVblTimer) { uint64_t d; clock_interval_to_deadline(16667, kMicrosecondScale, &d); scheduleCall(fVblTimer, d); }
+        FBLOG("phantom adopt fb%u: vbl timer %s", fIndex, fVblTimer ? "armed" : "ALLOCATE FAILED");
+    }
+    if (!fHwVblCall) {
+        fHwVblCall = nvrmfbCall(hwVblDeliver, this);
+        UInt32 hwvblArg = 1; PE_parse_boot_argn("nvhwvbl", &hwvblArg, sizeof hwvblArg);
+        fHwVblWanted = hwvblArg && fHwVblCall && fKms && fDev && fKms->registerVblankIntrCallback && fHead < 8;
+        FBLOG("phantom adopt fb%u: hw vblank on head %u: %s", fIndex, fHead,
+              !hwvblArg ? "OFF (nvhwvbl=0)" : fHwVblWanted ? "wanted -- registers once flips latch"
+                                                           : "not available - the timer stays the VBL");
+    }
+    if (!fReflip) fReflip = nvrmfbCall(reflipFire, this);
+    if (!fGpuWake) fGpuWake = nvrmfbCall(gpuWakeFire, this);
+    setProperty("NVRMAdoptVbl", (unsigned long long)(fVblTimer ? 1 : 0), 32);
+    // v12.6 parity (the v9 bring-up): the head is lit and announced from hotplugStartFire, not from here --
+    // a delayed applyMode + setDisplayMode first (with retries), and the connect interrupt only once a mode
+    // is on the head. Announcing immediately from adopt leaves the framework re-probing a head kapi has not
+    // finished lighting (the adopt black screen: all-green registry, frozen CRC, all-zero surface,
+    // CoreDisplay dropping the display).
+    fConnectFired = false;
+    fConnectTries = 0;
+    fBringupTries = 0;
+    if (!fHotplugStart) fHotplugStart = nvrmfbCall(hotplugStartFire, this);
+    setProperty("NVRMModeCount", (unsigned long long)getDisplayModeCount(), 32);
+    FBLOG("phantom fb%u: adopted display 0x%x on head %u %ux%u -- bring-up %s, %u mode(s) on offer", fIndex,
+          (unsigned)fDisplay, fHead, fW, fH, fHotplugStart ? "scheduled (1.5 s)" : "CALL ALLOC FAILED",
+          (unsigned)getDisplayModeCount());
+    if (fHotplugStart) {
+        uint64_t d; clock_interval_to_deadline(1500, kMillisecondScale, &d);
+        scheduleCall(fHotplugStart, d);
+        setProperty("NVRMAdoptScheduled", 1ull, 32);
+    }
     if (!fConnect.proc) {
         // IOFramebuffer records the handler WindowServer registers when it opens a framebuffer. None here means the
         // placeholder was never opened -- the connect interrupt would have nowhere to go, so this head is lit but the
@@ -2048,13 +2169,7 @@ bool NVRMNVDAFramebuffer::adoptFirstDisplay()
         setProperty("NVRMPhantomNoWaiter", (unsigned long long)1, 32);
         FBLOG("phantom fb%u: no connect handler was ever registered -- WindowServer never opened the placeholder; the head "
               "is lit, and moving the desktop here needs one WindowServer restart", fIndex);
-        return true;
     }
-    // Fire it whether or not one went out earlier: a connect change fired while this framebuffer still had no display
-    // (or before the display stack was listening) is exactly the one the framework may have dropped, and it counts as
-    // "already fired" for the purpose of this flag. The second, later one comes from connectNotifyFire.
-    fRefired = false;
-    notifyConnectionChanged(1200);
     return true;
 }
 void NVRMNVDAFramebuffer::hotplugKick()
@@ -2062,6 +2177,59 @@ void NVRMNVDAFramebuffer::hotplugKick()
     if (!gHotplug) return;
     uint64_t d; clock_interval_to_deadline(1500, kMillisecondScale, &d);
     thread_call_enter_delayed(gHotplug, d);
+}
+// v12.6 parity (the v9 bring-up, hotplugStartFire): a display adopted into the boot-time placeholder gets its
+// head lit and its display mode set on a delayed call, and the connect interrupt fires only once a mode is on
+// the head. Lighting and announcing immediately from adoptFirstDisplay leaves the framework re-probing a head
+// kapi has not finished lighting (the adopt black screen: all-green registry, frozen CRC, WindowServer
+// submitting an all-zero surface, CoreDisplay dropping the display). applyMode, not reflip: this head has no
+// mode yet -- fModeSet is false, so reflip's request is not a bootstrap and NVKMS accepts it without lighting
+// anything. setDisplayMode (the IOGraphics path) is what puts a real display mode on the framebuffer for a
+// display the framework never asked about.
+void NVRMNVDAFramebuffer::hotplugStartFire(thread_call_param_t p0, thread_call_param_t)
+{
+    NVRMNVDAFramebuffer *me = (NVRMNVDAFramebuffer *)p0;
+    if (!me) return;
+    NVRMCallReference callReference(me);
+    if (OSAddAtomic(0, &me->fStopping)) { FBLOG("phantom fb%u: bring-up: instance stopping", me->fIndex); return; }
+    me->fBringupTries++;
+    const bool lit = me->applyMode();
+    me->setProperty("NVRMHotplugLit", lit ? 1ull : 0ull, 32);
+    me->setProperty("NVRMAdoptedLit", (unsigned long long)(lit ? 1 : 0), 32);
+    FBLOG("phantom fb%u: bring-up try %u: head %u mode set -> %s", me->fIndex, me->fBringupTries, me->fHead,
+          lit ? "lit" : "refused");
+    // IOGraphics only asks how many modes a framebuffer has when the display is already known to it; for an
+    // adopted one the detailed-timing table can still be empty, and without it there is no mode id to set.
+    if (!me->fNDT) {
+        me->fNDT = me->addKmsRefreshModes(0);
+        FBLOG("phantom fb%u: bring-up filled the mode table with %u modes", me->fIndex, me->fNDT);
+    }
+    me->setProperty("NVRMModeCount", (unsigned long long)me->getDisplayModeCount(), 32);
+    if (lit) {
+        unsigned tried = 0;
+        for (unsigned i = 0; i < me->fNDT && i < 128 && tried < 5; i++) {
+            const IODisplayModeID id = (IODisplayModeID)me->fDT[i].detailedTimingModeID;
+            if (!id || id == me->fCurId) continue;
+            tried++;
+            const IOReturn r = me->setDisplayMode(id, 0);
+            me->setProperty("NVRMHotplugSwitchRc", (unsigned long long)(int)r, 32);
+            FBLOG("phantom fb%u: bring-up setDisplayMode 0x%x -> 0x%x", me->fIndex, (unsigned)id, (int)r);
+            if (r == kIOReturnSuccess) break;
+        }
+    }
+    // The head has a mode; announce the connection. CoreDisplay re-lists the displays and gives this one a
+    // pipe -- one delivery only, and only from this one place (connectNotifyFire's entry guard).
+    if (lit && me->fConnect.proc && !me->fConnectFired && me->fConnectNotify) {
+        uint64_t d; clock_interval_to_deadline(1500, kMillisecondScale, &d);
+        me->scheduleCall(me->fConnectNotify, d);
+        me->setProperty("NVRMConnectScheduled", 1ull, 32);
+        FBLOG("phantom fb%u: connect interrupt scheduled (the framework's handler, 1.5 s after the mode set)", me->fIndex);
+    }
+    // A head that is still coming up can refuse the first commit. Try a few more times before giving up.
+    if (!lit && me->fBringupTries < 4) {
+        uint64_t d; clock_interval_to_deadline(2, kSecondScale, &d);
+        me->scheduleCall(me->fHotplugStart, d);
+    }
 }
 // Boot-arg nvfbhotplugpoll=<seconds> (1..60): look for added and removed displays on a timer as well. Some laptops (a GTX 1660 Ti
 // with its mini-DP and HDMI wired to the GPU, issue 327) never deliver the display-change event while the GPU sleeps, so a
@@ -2092,13 +2260,15 @@ void NVRMNVDAFramebuffer::surroundCheck()
         FBLOG("surround: %u of %u members connected -- the displays become separate again", up, total);
         gSurroundMask = 0;
         master->fSurActive = false; master->fSurN = 0;
-        for (unsigned k = 1; k < total; k++) if (gFBs[idx[k]]) { gFBs[idx[k]]->fHidden = false; gFBs[idx[k]]->notifyConnectionChanged(500); }
+        for (unsigned k = 1; k < total; k++) if (gFBs[idx[k]]) { gFBs[idx[k]]->fHidden = false; gFBs[idx[k]]->fConnectFired = false; gFBs[idx[k]]->notifyConnectionChanged(500); }
+        master->fConnectFired = false;
         master->notifyConnectionChanged(500);
     } else {
         FBLOG("surround: all %u members are back -- the group re-forms", total);
         gSurroundMask = gSurroundMaskOrig;
         master->fSurActive = false; master->fSurN = 0;   // re-planned when WindowServer reads the mode list again
-        for (unsigned k = 1; k < total; k++) if (gFBs[idx[k]]) { gFBs[idx[k]]->fHidden = true; gFBs[idx[k]]->notifyConnectionChanged(500); }
+        for (unsigned k = 1; k < total; k++) if (gFBs[idx[k]]) { gFBs[idx[k]]->fHidden = true; gFBs[idx[k]]->fConnectFired = false; gFBs[idx[k]]->notifyConnectionChanged(500); }
+        master->fConnectFired = false;
         master->notifyConnectionChanged(500);
     }
 }
@@ -2158,6 +2328,7 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
                         fb->fDpyLost = true;
                         fb->fEdidSize = 0;
                         fb->clearDisplayAudioProperties();
+                        fb->fConnectFired = false;   // re-arm: the return is a fresh connection episode (v12.6)
                         if (nnotify < sizeof notify / sizeof notify[0]) { fb->retain(); notify[nnotify++] = fb; }
                     }
                 } else if (fb->fDpyLost || swapped) {
@@ -2206,6 +2377,7 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
             fb->fDpyLost = true;
             fb->fEdidSize = 0;
             fb->clearDisplayAudioProperties();
+            fb->fConnectFired = false;   // re-arm: the return is a fresh connection episode (v12.6)
             if (nnotify < sizeof notify / sizeof notify[0]) { fb->retain(); notify[nnotify++] = fb; }
         }
     }
@@ -2232,6 +2404,7 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
                 FBLOG("fb%u: reconnect has no readable EDID -- display-audio properties stay cleared", fb->fIndex);
             }
             fb->fRelightAudioValid = false;
+            fb->fConnectFired = false;   // re-arm: a returning or swapped display is a fresh episode (v12.6)
             fb->notifyConnectionChanged(500);
         }
         fb->release();
@@ -3439,7 +3612,7 @@ bool NVRMNVDAFramebuffer::start(IOService *provider)
     fSleepTap = addFramebufferNotification(&NVRMNVDAFramebuffer::sleepTap, this, nullptr);
     if (fHidden) {   // the group's master offers the combined mode once every member is up: tell it this one is
         NVRMNVDAFramebuffer *master = gFBs[nvrmSurroundMaster(gSurroundMask, (unsigned)gNDpy) & 7];
-        if (master && master != this) master->notifyConnectionChanged(500);
+        if (master && master != this) { master->fConnectFired = false; master->notifyConnectionChanged(500); }
     }
     if (!fSleepTap) FBLOG("sleep/wake notification tap not registered - a wake after dark wakes may leave the accelerator off");
     fVblTimer = nvrmfbCall(vblFire, this);
@@ -3509,7 +3682,7 @@ void NVRMNVDAFramebuffer::stop(IOService *provider)
         if (sl) IORecursiveLockUnlock(sl);
         if (mine) release();
     }
-    thread_call_t *calls[] = {&fHwVblCall, &fReflip, &fGpuWake, &fBars, &fVblTimer, &fSampler, &fHeadProbe, &fCursorCall, &fConnectNotify, &fAudioCall};
+    thread_call_t *calls[] = {&fHwVblCall, &fReflip, &fGpuWake, &fBars, &fVblTimer, &fSampler, &fHeadProbe, &fCursorCall, &fConnectNotify, &fAudioCall, &fHotplugStart};
     for (unsigned i = 0; i < sizeof calls / sizeof calls[0]; ++i) {
         thread_call_t call = *calls[i];
         if (!call) continue;

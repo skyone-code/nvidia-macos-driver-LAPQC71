@@ -1,0 +1,465 @@
+diff --git a/plugin/NVMTLDevice.m b/plugin/NVMTLDevice.m
+index 0048dd4fb..340c79bb2 100644
+--- a/plugin/NVMTLDevice.m
++++ b/plugin/NVMTLDevice.m
+@@ -1604,6 +1604,20 @@ static void nvmtl_vram_tag_set(IOSurfaceRef surf, NSUInteger plane, uint32_t see
+ // is never handed out past NVMTL_VRAM_KEEP_AGE_NS from its import, so a backing the family replaced is picked up again
+ // as before. A private image's imported surface pages (nvmtl_vk_image_write_host / _read_host) are kept the same way:
+ // pinning and mapping them costs more than copying a 1080p frame. NVMTL_VRAM_KEEP=0 turns both off.
++// A family VRAM validity tag covers all visible surface pixels. A partial
++// wrapper must use private backing so its upload cannot publish stale pixels
++// outside its own region as current. Row padding need not be covered.
++static int nvmtl_surf_wrap_whole(IOSurfaceRef surf, uint32_t w, uint32_t h, uint32_t bpp)
++{
++    const size_t width = IOSurfaceGetWidth(surf);
++    const size_t ew = IOSurfaceGetElementWidth(surf) ?: 1;
++    const size_t bytes = IOSurfaceGetBytesPerElement(surf);
++    const size_t elements = width / ew + (width % ew != 0);
++    const size_t pixel = bpp ?: 4;
++    if (!width || !bytes || elements > SIZE_MAX / bytes || w > SIZE_MAX / pixel) return 0;
++    return h == IOSurfaceGetHeight(surf) && (size_t)w * pixel >= elements * bytes;
++}
++
+ #define NVMTL_VRAM_KEEP_N       64
+ #define NVMTL_VRAM_KEEP_IDLE_NS (250ull * 1000 * 1000)
+ #define NVMTL_VRAM_KEEP_AGE_NS  (2000ull * 1000 * 1000)
+@@ -1717,7 +1731,7 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
+ {
+     if (surf && plane == 0 && IOSurfaceGetPlaneCount(surf) <= 1 && nvmtl_vk_surface_share_on()) {
+         size_t row = IOSurfaceGetBytesPerRow(surf), sh = IOSurfaceGetHeight(surf);
+-        if ((size_t)w * (bpp ? bpp : 4) <= row && h <= sh && row % 32 == 0) {
++        if ((size_t)w * (bpp ? bpp : 4) <= row && h <= sh && row % 32 == 0 && nvmtl_surf_wrap_whole(surf, w, h, bpp)) {
+             nvk_buffer vb; uint64_t born = 0;
+             if (!nvmtl_vram_keep_get(0, surf, 0, row * h, &vb, &born)) {
+                 if (!nvmtl_vk_image_create_buffer_alias(w, h, vkf, bpp, a8, stex, 1, &vb, 0, row, &t->_i)) {
+@@ -1781,7 +1795,7 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
+         nvlog("item 7: surface %u %ux%u plane %lu -> a private image, copied in and out (%s; row %zu bytes, %zu plane(s))",
+               (unsigned)IOSurfaceGetID(surf), w, h, (unsigned long)plane,
+               (plane != 0 || pplanes > 1) ? "more than one plane" : ((size_t)w * (bpp ? bpp : 4) > prow || h > IOSurfaceGetHeight(surf)) ? "image larger than the surface"
+-              : (prow % 32) ? "the row is not a multiple of 32 bytes" : "the family VRAM could not be used", prow, pplanes);
++              : (prow % 32) ? "the row is not a multiple of 32 bytes" : !nvmtl_surf_wrap_whole(surf, w, h, bpp) ? "a part of the surface" : "the family VRAM could not be used", prow, pplanes);
+     }
+     const int rc = nvmtl_vk_image_create_typed(w, h, vkf, bpp, a8, 1, stex, 2u, 1u, &t->_i);
+     if (!rc && surf) (void)nvmtl_vram_keep_get(1, surf, plane, 0, &t->_hostPages, &t->_vramBorn);
+@@ -1843,7 +1857,11 @@ static NSUInteger nvmtl_surface_usage(NSUInteger usage, BOOL fbo, BOOL storage)
+     // drawable. Request the real storage view before importing family VRAM;
+     // the private fallback already makes eligible formats writable.
+     if (!wantStex && nvmtl_surface_widen_usage(t->_fbo) && !a8 && nvmtl_vk_format_is_storage(vkf)) wantStex = 1;
+-    NSArray *key = surf ? @[@(IOSurfaceGetID(surf)), @(plane), @(w), @(h), @(d.pixelFormat), @(t->_ropt), @(t->_fbo)] : nil;
++    // NSArray keys with the same element count collide. Preserve every identity
++    // field in a byte key so surface wrappers can use content hashing.
++    NSData *key = nil;
++    if (surf) { const uint64_t k7[7] = { IOSurfaceGetID(surf), plane, w, h, d.pixelFormat, t->_ropt, (uint64_t)t->_fbo };
++                key = [NSData dataWithBytes:k7 length:sizeof k7]; }
+     NVMTLTexture *backing = key ? [cache objectForKey:key] : nil;
+     // Private and Managed tiled backings are local to this device. Repeated
+     // wrappers of the same surface must share that image,
+@@ -2838,7 +2856,9 @@ - (NSMutableDictionary *)copyIOSurfaceSharedTextureProperties:(MTLTextureDescrip
+             @"lod_min_clamp":@(sd.lodMinClamp),@"lod_max_clamp":@(sd.lodMaxClamp),
+             @"border_color":(@[@"TransparentBlack",@"OpaqueBlack",@"OpaqueWhite"])[MIN((NSUInteger)sd.borderColor,2u)],
+             @"reduction":@"WeightedAverage",@"lod_bias":@0};
+-        nvlog("pixel sampler: %s",s->_pixelState.description.UTF8String);
++        // Release logging drops this informational line unless the process opts
++        // in. Avoid constructing a dictionary description when it cannot emit.
++        if (!NVMTL_RELEASE || nvmtl_process_env_on()) nvlog("pixel sampler: %s",s->_pixelState.description.UTF8String);
+     }
+     int linear = (sd.minFilter == MTLSamplerMinMagFilterLinear || sd.magFilter == MTLSamplerMinMagFilterLinear);
+     int repeat = (sd.sAddressMode == MTLSamplerAddressModeRepeat);
+diff --git a/plugin/NVMTLLibraryLoad.h b/plugin/NVMTLLibraryLoad.h
+index a8d580605..634b4720b 100644
+--- a/plugin/NVMTLLibraryLoad.h
++++ b/plugin/NVMTLLibraryLoad.h
+@@ -23,6 +23,7 @@ static char kNVMTLRenderVert, kNVMTLRenderFrag;
+ static char kNVMTLMeshInfo;
+ static char kNVMTLMeshBinds;
+ // defined in NVMTLLibraryLoad.m
++static BOOL nvmtl_air_analysis_cacheable(NSString *ll);
+ static int nvmtl_xlate_ready(void);
+ static id<MTLIntersectionFunctionTable> nvmtl_ift_new(MTLIntersectionFunctionTableDescriptor *d, const char *what);
+ static id<MTLVisibleFunctionTable> nvmtl_vft_new(MTLVisibleFunctionTableDescriptor *d, const char *what);
+diff --git a/plugin/NVMTLLibraryLoad.m b/plugin/NVMTLLibraryLoad.m
+index e39184da3..18d75bec5 100644
+--- a/plugin/NVMTLLibraryLoad.m
++++ b/plugin/NVMTLLibraryLoad.m
+@@ -2998,8 +2998,11 @@ BOOL nvmtl_air_reads_function_table(NSString *air)
+                   @"!\"air.visible_function_table\"",
+                   @"!\"air.intersection_function_table\""];
+     });
++    // Every ASCII form contains this suffix. Reject ordinary modules with one
++    // literal search before checking the individual intrinsics and metadata.
++    if ([air rangeOfString:@"_function_table" options:NSLiteralSearch].location == NSNotFound) return NO;
+     for (NSString *f in forms)
+-        if ([air rangeOfString:f].location != NSNotFound) return YES;
++        if ([air rangeOfString:f options:NSLiteralSearch].location != NSNotFound) return YES;
+     return NO;
+ }
+ 
+diff --git a/plugin/NVMTLObjects.h b/plugin/NVMTLObjects.h
+index 3a05e35a2..938c3afa5 100644
+--- a/plugin/NVMTLObjects.h
++++ b/plugin/NVMTLObjects.h
+@@ -299,7 +299,8 @@ id<MTLCounterSet> nvmtl_timestamp_counter_set(void);
+ } @end
+ void nvmtl_texture_desc_swizzle(NVMTLTexture *t, MTLTextureDescriptor *d);
+ #include <os/lock.h>
+-@interface NVMTLResSet : NSMutableSet { @public NSMutableSet *_s; os_unfair_lock _lk; const void *_mru[8]; unsigned _mruNext; }
++#define NVMTL_RESSET_DM 128   /* NVMTLResSet's direct-mapped member cache (NVMTLObjects.m) */
++@interface NVMTLResSet : NSMutableSet { @public NSMutableSet *_s; os_unfair_lock _lk; const void *_mru[8]; unsigned _mruNext; const void *_dm[NVMTL_RESSET_DM]; }
+ - (NVMTLResSet *)nvmtlTakeAll;
+ @end
+ @interface NVMTLFunction () { @public NSString *_label; } @end
+diff --git a/plugin/NVMTLObjects.m b/plugin/NVMTLObjects.m
+index 482cece4c..55a3f5190 100644
+--- a/plugin/NVMTLObjects.m
++++ b/plugin/NVMTLObjects.m
+@@ -357,8 +357,22 @@ - (NSUInteger)countByEnumeratingWithState:(NSFastEnumerationState *)st objects:(
+ // _mru: objects added lately, each in the set until it is removed (the set retains it, so its address cannot be reused
+ // while it is listed). Encoders add the same few buffers, pipelines and samplers draw after draw (Apple's GL rebinds its
+ // vertex, index and uniform buffers for every draw), and a hit skips the set's hash lookup.
++// The direct-mapped cache also contains only retained members. Invalidate it on
++// removal, clear and transfer; collisions fall through to the identity set.
++// NVMTL_RESSET_CACHE=0 retains only the original MRU.
++static int nvmtl_resset_dm_on(void)
++{
++    static int on; static dispatch_once_t once;
++    dispatch_once(&once, ^{ const char *e = getenv("NVMTL_RESSET_CACHE"); on = !(e && e[0] == '0'); });
++    return on;
++}
++static inline unsigned nvmtl_resset_dm_slot(const void *p)
++{ return (unsigned)((((uint64_t)(uintptr_t)p >> 4) * 0x9E3779B97F4A7C15ull) >> 57) & (NVMTL_RESSET_DM - 1); }
++_Static_assert(NVMTL_RESSET_DM == 128, "nvmtl_resset_dm_slot keeps 7 bits");
+ - (void)addObject:(id)o { if (!o) return; const void *p = (__bridge const void *)o; os_unfair_lock_lock(&_lk);
+     for (unsigned k = 0; k < 8; k++) if (_mru[k] == p) { os_unfair_lock_unlock(&_lk); return; }
++    const int dm = nvmtl_resset_dm_on();
++    if (dm && _dm[nvmtl_resset_dm_slot(p)] == p) { os_unfair_lock_unlock(&_lk); return; }
+     // A malloc_size() test used to sit here, meant to catch a freed resource before -member: calls
+     // -hash on it. It cannot: a freed object's block normally stays a valid block in the default zone,
+     // so malloc_size returns its old size and the test passes - while a tagged pointer, or any object
+@@ -369,17 +383,20 @@ - (void)addObject:(id)o { if (!o) return; const void *p = (__bridge const void *
+     if (!had) { [_s addObject:o]; member = o; }
+     // An equal object need not be the object retained by NSMutableSet. Cache only the retained member's address.
+     _mru[_mruNext++ & 7] = (__bridge const void *)member;
++    if (dm) _dm[nvmtl_resset_dm_slot((__bridge const void *)member)] = (__bridge const void *)member;
+     os_unfair_lock_unlock(&_lk); if (!had) nvmtl_resref(o, 1); }
+ - (void)removeObject:(id)o { if (!o) return; os_unfair_lock_lock(&_lk); id member = [_s member:o];
+     if (member) [_s removeObject:member];
+     for (unsigned k = 0; k < 8; k++) if (_mru[k] == (__bridge const void *)member) _mru[k] = NULL;
++    if (member && _dm[nvmtl_resset_dm_slot((__bridge const void *)member)] == (__bridge const void *)member)
++        _dm[nvmtl_resset_dm_slot((__bridge const void *)member)] = NULL;
+     os_unfair_lock_unlock(&_lk); if (member) nvmtl_resref(member, -1); }
+ // Clearing, copying and sealing never go through -allObjects. That array is autoreleased into the CALLER's pool, and
+ // these run on the app's own commit thread: Geekbench 7 never drains that pool, so every resource a command buffer had
+ // ever touched stayed alive, and Super Resolution filled VRAM with 9 MB MPS buffers until allocations were refused.
+ // The sets below are owned (+1) and released at the end of scope.
+ - (void)removeAllObjects { NSMutableSet *fresh = nvmtl_identity_set(0), *old;
+-    os_unfair_lock_lock(&_lk); old = _s; _s = fresh; memset(_mru, 0, sizeof _mru); os_unfair_lock_unlock(&_lk);
++    os_unfair_lock_lock(&_lk); old = _s; _s = fresh; memset(_mru, 0, sizeof _mru); memset(_dm, 0, sizeof _dm); os_unfair_lock_unlock(&_lk);
+     for (id o in old) nvmtl_resref(o, -1); }
+ - (id)copyWithZone:(NSZone *)z { atomic_fetch_add(&gRes2Tick, 1);
+     NVMTLResSet *c = [NVMTLResSet new];
+@@ -394,7 +411,7 @@ - (id)mutableCopyWithZone:(NSZone *)z { return [self copyWithZone:z]; }
+ // new owner, so each resource's residency count is unchanged; the new set's -dealloc gives it back.
+ - (NVMTLResSet *)nvmtlTakeAll { atomic_fetch_add(&gRes2Tick, 1);
+     NVMTLResSet *taken = [NVMTLResSet new]; NSMutableSet *empty = taken->_s;
+-    os_unfair_lock_lock(&_lk); taken->_s = _s; _s = empty; memset(_mru, 0, sizeof _mru); os_unfair_lock_unlock(&_lk);
++    os_unfair_lock_lock(&_lk); taken->_s = _s; _s = empty; memset(_mru, 0, sizeof _mru); memset(_dm, 0, sizeof _dm); os_unfair_lock_unlock(&_lk);
+     return taken; }
+ - (void)dealloc { for (id o in _s) nvmtl_resref(o, -1); }
+ @end
+@@ -1168,16 +1185,27 @@ uint32_t nvmtl_function_spv_fnv(id f)
+ uint64_t nvmtl_function_air_key(id f)
+ {
+     if (![f isKindOfClass:[NVMTLFunction class]]) return 0;
+-    NVMTLFunction *fn = f; static char kKey;
++    NVMTLFunction *fn = f; static char kKey, kTextKey;
+     NSNumber *h = objc_getAssociatedObject(fn, &kKey);
+     if (h) return h.unsignedLongLongValue;
++    // Functions from one module share its digest. Cache only text produced and
++    // marked immutable by the AIR loader; external text may change between calls.
++    NSString *air = fn->_air;
++    const BOOL onText = nvmtl_air_analysis_cacheable(air);
++    if (onText && (h = objc_getAssociatedObject(air, &kTextKey))) {
++        objc_setAssociatedObject(fn, &kKey, h, OBJC_ASSOCIATION_RETAIN);
++        return h.unsignedLongLongValue;
++    }
+     uint64_t v = 0;
+-    if (fn->_air.length) {
+-        const char *s = fn->_air.UTF8String; unsigned char dg[CC_SHA256_DIGEST_LENGTH];
++    if (air.length) {
++        const char *s = air.UTF8String; unsigned char dg[CC_SHA256_DIGEST_LENGTH];
+         CC_SHA256(s, (CC_LONG)strlen(s), dg);
+         for (int i = 0; i < 8; i++) v = (v << 8) | dg[i];
+     }
+-    objc_setAssociatedObject(fn, &kKey, @(v), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
++    if (onText) {
++        objc_setAssociatedObject(air, &kTextKey, @(v), OBJC_ASSOCIATION_RETAIN);
++        objc_setAssociatedObject(fn, &kKey, @(v), OBJC_ASSOCIATION_RETAIN);
++    }
+     return v;
+ }
+ static void nvmtl_heap_register(NVMTLHeap *heap, id resource);
+@@ -1347,8 +1375,11 @@ static void nvmtl_census(const char *what, uint32_t w, uint32_t h, int surf) {
+ }
+ static void nvmtl_frame_dump(const char *tag, const void *base, size_t row, uint32_t w, uint32_t h);
+ static void nvmtl_surface_cpu_dump(NVMTLTexture *rt) {
++    // Plain textures have no surface to dump. The diagnostic file poll needs
++    // only an approximate clock, not an exact timestamp on every texture bind.
++    if (!rt || !rt->_surf) return;
+     static uint64_t next; static int on;
+-    uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
++    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW_APPROX);
+     if (now >= next) { next = now + 250000000ull; on = access("/tmp/nvmtl-dump-request", F_OK) == 0; }
+     if (!on || !rt || !rt->_surf || IOSurfaceGetBytesPerElement(rt->_surf) != 4 || IOSurfaceGetPlaneCount(rt->_surf) > 1) return;
+     if (IOSurfaceLock(rt->_surf, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) { static int said; if (!said++) nvlog("G16 cpu dump: IOSurfaceLock failed"); return; }
+@@ -2021,7 +2052,11 @@ static uint32_t nvmtl_tex_attach_vkfmt(NVMTLTexture *t, int *a8) {
+     if (tt == MTLTextureTypeTextureBuffer || [self nvi]->mtl_type == 9)
+         return tt == MTLTextureTypeTextureBuffer && [self nvi]->mtl_type == 9 ? nvmtl_texbuf_view(self, f) : nil;
+     if (tt == MTLTextureType3D && [self nvi]->mtl_type == 7 && !slices.location) slices = NSMakeRange(0, 1);
+-    if (((tt == MTLTextureType1D || tt == MTLTextureType1DArray) && [self nvi]->mtl_type != (uint32_t)tt) || (tt == MTLTextureType2DMultisample && ([self nvi]->mtl_type != 4 && [self nvi]->mtl_type != 8)) || (tt == MTLTextureType2DMultisampleArray && [self nvi]->mtl_type != 8) || (([self nvi]->mtl_type == 4 || [self nvi]->mtl_type == 8) && tt != MTLTextureType2DMultisample && tt != MTLTextureType2DMultisampleArray) || (tt == MTLTextureType3D && [self nvi]->mtl_type != 7)) { nvlog("newTextureView: textureType %lu of a %u-typed texture — not carried", (unsigned long)tt, [self nvi]->mtl_type); return nil; }
++    // A Vulkan 1D image supports both Metal 1D view types. Non-array views
++    // select exactly one slice; preserve the existing bounds checks above.
++    if (((tt == MTLTextureType1D || tt == MTLTextureType1DArray) &&
++         ([self nvi]->mtl_type > 1 || (tt == MTLTextureType1D && slices.length != 1))) ||
++        (tt == MTLTextureType2DMultisample && ([self nvi]->mtl_type != 4 && [self nvi]->mtl_type != 8)) || (tt == MTLTextureType2DMultisampleArray && [self nvi]->mtl_type != 8) || (([self nvi]->mtl_type == 4 || [self nvi]->mtl_type == 8) && tt != MTLTextureType2DMultisample && tt != MTLTextureType2DMultisampleArray) || (tt == MTLTextureType3D && [self nvi]->mtl_type != 7)) { nvlog("newTextureView: textureType %lu of a %u-typed texture — not carried", (unsigned long)tt, [self nvi]->mtl_type); return nil; }
+     NVMTLTexture *v = [NVMTLTexture new];
+     { NVMTLTexture *vp_ = _parent ? _parent : self; __atomic_fetch_add(&vp_->_nviews, 1, __ATOMIC_ACQ_REL); }  v->_parent = _parent ? _parent : self; v->_usage = [self usage];  v->_q = _q; v->_fmt = f; v->_surf = _surf; v->_plane = _plane; v->_mips = (uint32_t)levels.length;
+     v->_viewParent = self; v->_relativeLevel = (uint32_t)levels.location; v->_relativeSlice = (uint32_t)slices.location;
+@@ -2300,16 +2335,25 @@ @implementation NVMTLFunction
+         row = [NSRegularExpression regularExpressionWithPattern:@"^![0-9]+ = !\\{[^\\n]*\\.MTL_FC_INIT_[^\\n]*, !\"([^\"]+)\", !\"([^\"]+)\", i32 ([0-9]+), i1 (true|false)\\}$" options:NSRegularExpressionAnchorsMatchLines error:NULL];
+         any = [NSRegularExpression regularExpressionWithPattern:@"^![0-9]+ = !\\{[^\\n]*\\.MTL_FC_INIT_" options:NSRegularExpressionAnchorsMatchLines error:NULL];
+     });
+-    NSMutableArray *out = [NSMutableArray new];
+     if (rows) *rows = 0;
+-    if (!air.length) return out;
++    if (!air.length) return @[];
++    // Function specialization reuses these rows across functions from the same
++    // immutable module, including empty and unrecognized-row results.
++    static char kMemo;
++    const BOOL onText = nvmtl_air_analysis_cacheable(air);
++    NSArray *memo = onText ? objc_getAssociatedObject(air, &kMemo) : nil;
++    if (memo.count == 2) { if (rows) *rows = [memo[1] unsignedIntegerValue]; return memo[0]; }
++    NSMutableArray *out = [NSMutableArray new];
+     NSRange all = NSMakeRange(0, air.length);
+-    if (rows) *rows = [any numberOfMatchesInString:air options:0 range:all];
++    const NSUInteger nrows = [any numberOfMatchesInString:air options:0 range:all];
++    if (rows) *rows = nrows;
+     for (NSTextCheckingResult *r in [row matchesInString:air options:0 range:all])
+         [out addObject:@{ @"type": [air substringWithRange:[r rangeAtIndex:1]], @"name": [air substringWithRange:[r rangeAtIndex:2]],
+                           @"index": @([[air substringWithRange:[r rangeAtIndex:3]] longLongValue]),
+                           @"required": @([[air substringWithRange:[r rangeAtIndex:4]] isEqualToString:@"true"]) }];
+-    return out;
++    NSArray *answer = [out copy];
++    if (onText) objc_setAssociatedObject(air, &kMemo, @[answer, @(nrows)], OBJC_ASSOCIATION_RETAIN);
++    return answer;
+ }
+ - (NSDictionary<NSString *, MTLFunctionConstant *> *)functionConstantsDictionary {
+     static char key;
+@@ -4714,44 +4758,47 @@ - (void)endEncoding {
+     [self nvmtlCloseVisibility];
+     if (_begun) nvmtl_vk_cmd_end_render(&_cb->_c);
+     nvmtl_hz_encoder_end(&_cb->_c);
+-    NSMutableDictionary *groups = [NSMutableDictionary new];
+-    BOOL needScratch = NO;
+-    for (NSArray *record in _visRecords) {
+-        NSNumber *offset = record[1];
+-        NSMutableArray *queries = groups[offset];
+-        if (!queries) { queries = [NSMutableArray new]; groups[offset] = queries; }
+-        [queries addObject:record[0]];
+-        if (queries.count > 1) needScratch = YES;
+-    }
+-    NVMTLBuffer *scratch = nil;
+-    if (needScratch) {
+-        scratch = [NVMTLBuffer new];
+-        if (nvmtl_vk_buffer_create(_visRecords.count * 8, 0, &scratch->_b)) {
+-            [self nvmtlVisibilityError:[NSString stringWithFormat:@"visibility: accumulation scratch allocation failed"]]; scratch = nil;
+-        } else {
+-            if (!_cb->_scratch) _cb->_scratch = [NSMutableArray new];
+-            [_cb->_scratch addObject:scratch];
++    // Most encoders record no visibility results and need no grouping storage.
++    if (_visRecords.count) {
++        NSMutableDictionary *groups = [NSMutableDictionary new];
++        BOOL needScratch = NO;
++        for (NSArray *record in _visRecords) {
++            NSNumber *offset = record[1];
++            NSMutableArray *queries = groups[offset];
++            if (!queries) { queries = [NSMutableArray new]; groups[offset] = queries; }
++            [queries addObject:record[0]];
++            if (queries.count > 1) needScratch = YES;
+         }
+-    }
+-    size_t cursor = 0;
+-    for (NSNumber *key in groups) {
+-        NSArray *queries = groups[key]; size_t offset = key.unsignedLongLongValue;
+-        if (queries.count > 1 && !scratch) continue;
+-        nvk_buffer *dst = queries.count > 1 ? &scratch->_b : &_visBuf->_b;
+-        size_t first = cursor;
+-        for (NSNumber *value in queries) {
+-            uint32_t query = value.unsignedIntValue;
+-            size_t out = queries.count > 1 ? cursor++ * 8 : offset;
+-            if (query == UINT32_MAX) {
+-                if (nvmtl_vk_cmd_write_word(&_cb->_c, dst, out, 0) ||
+-                    nvmtl_vk_cmd_write_word(&_cb->_c, dst, out + 4, 0))
+-                    [self nvmtlVisibilityError:[NSString stringWithFormat:@"visibility: empty result write failed at offset %zu", out]];
+-            } else if (nvmtl_vk_cmd_copy_occlusion(&_cb->_c, query, 1, dst, out))
+-                [self nvmtlVisibilityError:[NSString stringWithFormat:@"visibility: result copy failed at offset %zu", out]];
++        NVMTLBuffer *scratch = nil;
++        if (needScratch) {
++            scratch = [NVMTLBuffer new];
++            if (nvmtl_vk_buffer_create(_visRecords.count * 8, 0, &scratch->_b)) {
++                [self nvmtlVisibilityError:[NSString stringWithFormat:@"visibility: accumulation scratch allocation failed"]]; scratch = nil;
++            } else {
++                if (!_cb->_scratch) _cb->_scratch = [NSMutableArray new];
++                [_cb->_scratch addObject:scratch];
++            }
++        }
++        size_t cursor = 0;
++        for (NSNumber *key in groups) {
++            NSArray *queries = groups[key]; size_t offset = key.unsignedLongLongValue;
++            if (queries.count > 1 && !scratch) continue;
++            nvk_buffer *dst = queries.count > 1 ? &scratch->_b : &_visBuf->_b;
++            size_t first = cursor;
++            for (NSNumber *value in queries) {
++                uint32_t query = value.unsignedIntValue;
++                size_t out = queries.count > 1 ? cursor++ * 8 : offset;
++                if (query == UINT32_MAX) {
++                    if (nvmtl_vk_cmd_write_word(&_cb->_c, dst, out, 0) ||
++                        nvmtl_vk_cmd_write_word(&_cb->_c, dst, out + 4, 0))
++                        [self nvmtlVisibilityError:[NSString stringWithFormat:@"visibility: empty result write failed at offset %zu", out]];
++                } else if (nvmtl_vk_cmd_copy_occlusion(&_cb->_c, query, 1, dst, out))
++                    [self nvmtlVisibilityError:[NSString stringWithFormat:@"visibility: result copy failed at offset %zu", out]];
++            }
++            if (queries.count > 1 && nvmtl_vk_cmd_sum_occlusion(&_cb->_c, &scratch->_b, first,
++                                                              (uint32_t)queries.count, &_visBuf->_b, offset))
++                [self nvmtlVisibilityError:[NSString stringWithFormat:@"visibility: accumulation failed at offset %zu", offset]];
+         }
+-        if (queries.count > 1 && nvmtl_vk_cmd_sum_occlusion(&_cb->_c, &scratch->_b, first,
+-                                                          (uint32_t)queries.count, &_visBuf->_b, offset))
+-            [self nvmtlVisibilityError:[NSString stringWithFormat:@"visibility: accumulation failed at offset %zu", offset]];
+     }
+     _visRecords = nil;
+     if (_begun) return;
+diff --git a/plugin/nvmtl_vk.c b/plugin/nvmtl_vk.c
+index 3bd136cc5..cded2793c 100644
+--- a/plugin/nvmtl_vk.c
++++ b/plugin/nvmtl_vk.c
+@@ -3039,6 +3039,7 @@ typedef struct { nvmtl_slot s[2][NVMTL_NBIND];
+                  uint8_t dirty[2]; VkDescriptorSet last[2]; unsigned last_idx[2]; uint32_t last_hi[2]; uint64_t lastw[2][4];
+                  uint64_t chg[2][NVMTL_BINDING_WORDS]; uint64_t texgen[2]; const void *emb_fn[2]; uint64_t emb_gen[2]; uint32_t emb_n[2];
+                  uint64_t address_tex[2][NVMTL_NTEX]; uint8_t address_tex_valid[2];
++                 uint64_t address_tex_dirty[2][(NVMTL_NTEX + 63) / 64];   /* entries of a valid address_tex whose slot changed since */
+                  uint64_t emb_key[2][NVMTL_EMB_KEYMAX];
+                  uint32_t lastdyn[2]; void *lasttab[2];
+                  uint64_t lasttb[2][4];   /* the texel-buffer mask the last set was written with */
+@@ -3763,6 +3764,28 @@ static void nvmtl_vk_bindless_drop_now(uint32_t slot)
+ 
+ int nvmtl_vk_bind_buffer_offset(nvk_cmdbuf *c, uint32_t set, uint32_t index, size_t offset);
+ 
++// Each texture change dirties its own cached address entry. Buffer-only changes
++// leave these entries intact; each GPU snapshot still receives its own copy.
++// Keep a full-rebuild fallback and an optional comparison for diagnostics.
++static int g_addr_tex_inc, g_addr_tex_verify;
++static pthread_once_t g_addr_tex_once = PTHREAD_ONCE_INIT;
++static void nvmtl_addr_tex_options(void)
++{
++    const char *inc = getenv("NVMTL_ADDR_TEX_INC"), *verify = getenv("NVMTL_ADDR_TEX_VERIFY");
++    g_addr_tex_inc = !(inc && inc[0] == '0');
++    g_addr_tex_verify = verify && verify[0] == '1';
++}
++static int nvmtl_addr_tex_inc_on(void)
++{
++    pthread_once(&g_addr_tex_once, nvmtl_addr_tex_options);
++    return g_addr_tex_inc;
++}
++static int nvmtl_addr_tex_verify_on(void)
++{
++    pthread_once(&g_addr_tex_once, nvmtl_addr_tex_options);
++    return g_addr_tex_verify;
++}
++
+ static int nvmtl_bind_slot(nvk_cmdbuf *c, uint32_t set, uint32_t binding, uint8_t kind, void *h, size_t off)
+ {
+     if (set > 1 || binding >= NVMTL_NBIND) return -1;
+@@ -3785,7 +3808,11 @@ static int nvmtl_bind_slot(nvk_cmdbuf *c, uint32_t set, uint32_t binding, uint8_
+         t->dirty[set] = 1;
+         t->chg[set][binding >> 6] |= 1ull << (binding & 63);
+         if (kind != NVMTL_SLOT_BUF || sl->kind != NVMTL_SLOT_BUF) t->texgen[set]++;
+-        if (binding >= NVMTL_NBUF && binding < NVMTL_NBUF + NVMTL_NTEX) t->address_tex_valid[set] = 0;
++        if (binding >= NVMTL_NBUF && binding < NVMTL_NBUF + NVMTL_NTEX) {
++            const uint32_t k = binding - NVMTL_NBUF;
++            if (nvmtl_addr_tex_inc_on()) t->address_tex_dirty[set][k >> 6] |= 1ull << (k & 63);
++            else t->address_tex_valid[set] = 0;
++        }
+     }
+     if (sl->kind != kind || sl->h != h) nvmtl_hz_slot_bound(c, t, set, binding, kind, h);   // hazard keys change only with the handle
+     sl->kind = kind; sl->h = h; sl->off = off;
+@@ -4162,6 +4189,8 @@ static int nvmtl_address_snapshot(nvk_cmdbuf *c, uint32_t which, VkDescriptorBuf
+     // texture-index portion in this recording's bind table, then copy it into
+     // each immutable GPU snapshot. Texture/view/texel transitions invalidate it
+     // in nvmtl_bind_slot; nvmtl_vk_bind_texture_view fills size before a snapshot.
++    // A changed slot marks its entry (nvmtl_addr_tex_inc_on); only the marked entries are recomputed here, after
++    // nvmtl_vk_bind_texture_view has written their size.
+     if (t) {
+         if (!t->address_tex_valid[which]) {
+             for (unsigned i = 0; i < NVMTL_NTEX; ++i) {
+@@ -4169,6 +4198,27 @@ static int nvmtl_address_snapshot(nvk_cmdbuf *c, uint32_t which, VkDescriptorBuf
+                 t->address_tex[which][i] = s->kind == NVMTL_SLOT_TEX && s->h ? (uint64_t)s->size : 0;
+             }
+             t->address_tex_valid[which] = 1;
++            memset(t->address_tex_dirty[which], 0, sizeof t->address_tex_dirty[which]);
++        } else {
++            for (unsigned w = 0; w < (NVMTL_NTEX + 63) / 64; w++) {
++                for (uint64_t bits = t->address_tex_dirty[which][w]; bits; bits &= bits - 1) {
++                    const unsigned i = w * 64 + (unsigned)__builtin_ctzll(bits);
++                    if (i >= NVMTL_NTEX) break;
++                    const nvmtl_slot *s = &t->s[which][NVMTL_NBUF + i];
++                    t->address_tex[which][i] = s->kind == NVMTL_SLOT_TEX && s->h ? (uint64_t)s->size : 0;
++                }
++                t->address_tex_dirty[which][w] = 0;
++            }
++            if (nvmtl_addr_tex_verify_on()) {
++                static _Atomic unsigned said;
++                for (unsigned i = 0; i < NVMTL_NTEX; ++i) {
++                    const nvmtl_slot *s = &t->s[which][NVMTL_NBUF + i];
++                    const uint64_t want = s->kind == NVMTL_SLOT_TEX && s->h ? (uint64_t)s->size : 0;
++                    if (t->address_tex[which][i] != want && atomic_fetch_add(&said, 1) < 16)
++                        nvlog("vk: address-table texture entry %u of set %u FAILED its check: cached %llu, slot says %llu", i, which,
++                              (unsigned long long)t->address_tex[which][i], (unsigned long long)want);
++                }
++            }
+         }
+         memcpy(addresses + 2 * NVMTL_NBUF, t->address_tex[which], sizeof t->address_tex[which]);
+     } else memset(addresses + 2 * NVMTL_NBUF, 0, NVMTL_NTEX * sizeof(uint64_t));
+@@ -4308,6 +4358,17 @@ static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint
+ static VkDescriptorSet nvmtl_snapshot_set_m(nvk_cmdbuf *c, uint32_t which, uint32_t stex_hi, const uint64_t *mask, const uint64_t *tb)
+ { return nvmtl_snapshot_set_md(c, which, stex_hi, mask, tb, VK_NULL_HANDLE, NULL, NULL); }
+ #define NVMTL_COPY_HAS(m, i) ((m) && (((m)[(i) >> 6] >> ((i) & 63)) & 1))
++static int g_snap_walk;
++static pthread_once_t g_snap_walk_once = PTHREAD_ONCE_INIT;
++static void nvmtl_snap_walk_options(void)
++{
++    const char *e = getenv("NVMTL_SNAP_WALK"); g_snap_walk = !(e && e[0] == '0');
++}
++static int nvmtl_snap_walk_on(void)
++{
++    pthread_once(&g_snap_walk_once, nvmtl_snap_walk_options);
++    return g_snap_walk;
++}
+ static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint32_t stex_hi, const uint64_t *mask, const uint64_t *tb,
+                                              VkDescriptorSet from, const uint64_t *copym, const VkDescriptorBufferInfo *uniform)
+ {
+@@ -4402,7 +4463,14 @@ static VkDescriptorSet nvmtl_snapshot_set_md(nvk_cmdbuf *c, uint32_t which, uint
+     VkDescriptorImageInfo  dummyS = { g_dummySampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED };
+     nvmtl_bindtable *t = (nvmtl_bindtable *)c->table;
+     uint32_t nw = 0;
+-    for (uint32_t i = 0; i < NVMTL_STEX_BASE; i++) {
++    // Sparse masks visit only named bindings, preserving ascending write order.
++    // A null mask or NVMTL_SNAP_WALK=0 retains the full walk.
++    uint64_t walk[(NVMTL_STEX_BASE + 63) / 64];
++    const int sparse = mask && nvmtl_snap_walk_on();
++    for (uint32_t k = 0; k < (NVMTL_STEX_BASE + 63) / 64; k++) walk[k] = sparse ? mask[k] : ~0ull;
++    if (NVMTL_STEX_BASE & 63) walk[NVMTL_STEX_BASE >> 6] &= (1ull << (NVMTL_STEX_BASE & 63)) - 1;
++    for (uint32_t wi = 0; wi < (NVMTL_STEX_BASE + 63) / 64; wi++) for (uint64_t bits = walk[wi]; bits; ) {
++        const uint32_t i = wi * 64 + (uint32_t)__builtin_ctzll(bits); bits &= bits - 1;
+         if (!NVMTL_E78_HAS(mask, i)) continue;
+         VkDescriptorType ty = binding_type(i);
+         const nvmtl_slot *sl = nvmtl_slot_checked(t ? &t->s[which][i] : NULL, which, i);

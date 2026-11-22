@@ -76,6 +76,35 @@ static inline int nv_iop_convert_row(volatile unsigned *dp, const volatile unsig
     } else return -1;
     return 0;
 }
+/*
+ * Diagnostic (debug.nvaccel_bars): overwrite the top `rows` lines of the scanout with a colour strip, inside the same
+ * transaction that copies the frame. Nothing writes that memory between this point and the flip, so what the panel
+ * shows answers exactly one question: do the writes this accelerator makes to the destination the framebuffer
+ * described actually reach the head that is scanning? Strip on the panel = yes; no strip = the copy lands elsewhere,
+ * however healthy the counters read. `phase` shifts the colour order so a live strip visibly moves.
+ */
+static inline void nv_iop_paint_bars(volatile unsigned *d, unsigned dpr, unsigned w, unsigned h,
+                                     int dst30, unsigned rows, unsigned phase)
+{
+    static const unsigned char cols[8][3] = {
+        {255, 0, 0}, {0, 255, 0}, {0, 0, 255}, {255, 255, 0},
+        {255, 0, 255}, {0, 255, 255}, {255, 255, 255}, {0, 0, 0}
+    };
+    if (!d || !dpr || !w || !h) return;
+    if (rows > h) rows = h;
+    for (unsigned y = 0; y < rows; y++) {
+        volatile unsigned *row = d + (unsigned long)y * dpr;
+        for (unsigned x = 0; x < w; x++) {
+            unsigned seg = (x * 8u) / w;
+            const unsigned char *c = cols[(seg + phase) & 7u];
+            if (dst30)
+                row[x] = 0xC0000000u | (nv_iop_c8_to_c10(c[2]) << 20) | (nv_iop_c8_to_c10(c[1]) << 10) | nv_iop_c8_to_c10(c[0]);
+            else
+                row[x] = 0xff000000u | ((unsigned)c[0] << 16) | ((unsigned)c[1] << 8) | (unsigned)c[2];
+        }
+    }
+}
+
 #define NV_IOP_BYTES_PER_PIXEL(fmt) ((fmt) == NV_IOP_FMT_RGHA ? 8u : 4u)
 
 #endif
