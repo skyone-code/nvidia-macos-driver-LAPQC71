@@ -5,6 +5,7 @@
  */
 
 #include "../nvrm_off.h"
+#include <libkern/version.h>
 #include <IOKit/graphics/IOGraphicsTypes.h>
 #ifndef detailedTimingModeID
 #define detailedTimingModeID __reservedA[0]
@@ -2570,10 +2571,7 @@ bool NVRMNVDAFramebuffer::activateStandby()
     // The standby framebuffer is about to become visible to WindowServer.
     clock_interval_to_deadline(15000, kMillisecondScale, &fBlackLutDeadline);
     takeEdid(sink.edid, sink.edidSize);
-    {
-        NVRMDisplayGate sinkGate(fDdcSinkLock);
-        fDpyLost = false;
-    }
+    fDpyLost = false;
     fStandby = false;
     publishTimingCaps();
     publishStartupTiming();
