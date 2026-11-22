@@ -291,6 +291,13 @@ enum NvKmsDebugForceColorSpace nvkms_debug_force_color_space(void) { return NVKM
 NvBool nvkms_enable_overlay_layers(void)        { return NV_TRUE; }
 NvBool nvkms_debug_logging(void)                { return NV_FALSE; }
 
+// 620.73.04 kapi takes the PM read lock around paths that call RM directly. The xnu port has
+// no PM lock: reaching RM while suspended is already serialized by the gKmsTraceRm gate below
+// (and NVKMS suspend/resume run on the PM thread it lets through), so these are no-ops, as the
+// os-interface header prescribes for platforms without a PM lock.
+void nvkms_lock_pm_from_kapi(void)   { }
+void nvkms_unlock_pm_from_kapi(void) { }
+
 static bool gKmsTraceRm = true;
 void nvkms_call_rm(void *ops)
 {
