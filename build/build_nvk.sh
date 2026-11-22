@@ -60,8 +60,14 @@ S=$OUT/mesa; rm -rf "$S" "$OUT/ogkm"; mkdir -p "$S"
 git -C "$MESA_GIT" archive "$BASE" | tar -x -C "$S"
 
 # Headers: NVK compiles against the 610 open kernel module headers with the 620 nvos.h change applied.
+# 620.73.04 ships the NUMA-node nvos.h change natively (ogkm-nvos-620.patch detects reversed there), so it is
+# skipped whenever the definitions are already present; older ogkm trees still need it.
 cp -R "$OGKM" "$OUT/ogkm"
-patch -p1 -s --no-backup-if-mismatch -d "$OUT/ogkm" < "$NVK/ogkm-nvos-620.patch"
+if ! grep -q NVOS02_FLAGS_NUMA_NODE_VALID "$OUT/ogkm/src/common/sdk/nvidia/inc/nvos.h"; then
+  patch -p1 -s --no-backup-if-mismatch -d "$OUT/ogkm" < "$NVK/ogkm-nvos-620.patch"
+else
+  echo "ogkm-nvos-620: already in nvos.h, skipped"
+fi
 [ "$REL" = 2.8 ] || patch -p1 -s --no-backup-if-mismatch -d "$OUT/ogkm" < "$NVK/ogkm-warnings.patch"   # DRF_MASK, also defined by Mesa's drf.h
 
 for p in $CHAIN; do
@@ -84,6 +90,7 @@ find "$S" -name '*.orig' -o -name '*.rej' | grep . && { echo "STOP: patch left .
 H=$OUT/host
 if [ ! -x "$H/bin/mesa_clc" ] || [ ! -x "$H/bin/vtn_bindgen2" ]; then
   meson setup "$OUT/clc-native" "$S" -Dbuildtype=release -Dprefix="$H" -Dllvm=enabled -Dmesa-clc=enabled -Dinstall-mesa-clc=true \
+    -Dcpp_rtti=false \
     -Dvulkan-drivers= -Dgallium-drivers= -Dplatforms= -Degl=disabled -Dgbm=disabled -Dgles1=disabled -Dgles2=disabled -Dglx=disabled \
     -Dopengl=false > "$OUT/clc-native.setup.log" 2>&1
   ninja -C "$OUT/clc-native" -j"$JOBS" src/compiler/clc/mesa_clc src/compiler/spirv/vtn_bindgen2 > "$OUT/clc-native.log" 2>&1
