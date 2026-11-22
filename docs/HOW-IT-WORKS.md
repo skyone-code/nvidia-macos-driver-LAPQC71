@@ -22,7 +22,7 @@ NVK  (Mesa's Vulkan driver for NVIDIA, with the NAK compiler)      [nvk/nvk-maco
 NVRM.kext  (NVIDIA's open GPU kernel modules, r610, ported to XNU) [kexts/NVRM]
         |  talks to the GPU's GSP firmware
         v
-GeForce RTX GPU  (GSP firmware from /Library/NullMoth/nvfw/nvidia/620.70.06)
+GeForce RTX GPU  (GSP firmware from /Library/NullMoth/nvfw/nvidia/620.73.04)
 ```
 
 Display and compositing run beside that path:
@@ -40,7 +40,7 @@ Linux's. At start it:
 1. claims the PCI device, maps its BARs, and places BAR1 (the GPU-visible window into video memory) outside the firmware
    console;
 2. holds the I/O registry busy so WindowServer does not start on the firmware screen;
-3. on its own thread, loads the GSP firmware from `/Library/NullMoth/nvfw/nvidia/620.70.06/` and boots the GPU with
+3. on its own thread, loads the GSP firmware from `/Library/NullMoth/nvfw/nvidia/620.73.04/` and boots the GPU with
    `rm_init_adapter()`;
 4. brings up NVKMS (NVIDIA's mode-setting) and releases the hold once the display is armed.
 

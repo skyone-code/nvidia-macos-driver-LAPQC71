@@ -1,7 +1,7 @@
 #!/bin/bash
 # fw_fetch.sh --dest DIR [--run FILE] [--installed DIR]
 #
-# Puts the GSP firmware for the NVIDIA 620.70.06 driver under DIR/nvidia/620.70.06/ without the package carrying it.
+# Puts the GSP firmware for the NVIDIA 620.73.04 driver under DIR/nvidia/620.73.04/ without the package carrying it.
 # The files are NVIDIA's, unmodified, taken from NVIDIA's own Linux driver package (the same pinned .run that
 # dlss_fetch.sh reads), and every file is checked against a pinned SHA-256 before it is accepted.
 #
@@ -19,17 +19,17 @@ PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH
 HERE=$(cd "$(dirname "$0")" && pwd)
 
 # ---- pins (keep URL_RUN / SHA_RUN equal to dlss_fetch.sh; tools/test_fw_fetch.py checks that) -----------------------
-VER=620.70.06
+VER=620.73.04
 URL_RUN="https://download.nvidia.com/XFree86/Linux-x86_64/$VER/NVIDIA-Linux-x86_64-$VER.run"
-SHA_RUN=29118e3abd08c07559bcca3d9c76238d039490af0362a2e5bcfcbe7204afd4b1
+SHA_RUN=b5f2e2d5da8435b32539304015b89bf7eb22fe0aec8cd6905b7a6e8a9f9b8f1b
 # member in the .run -> SHA-256 of the file
 FW_MEMBERS="firmware/gsp_tu10x.bin firmware/gsp_ga10x.bin firmware/ucodes_tu10x.bin firmware/ucodes_ga10x.bin"
 fw_sha() {
   case "$1" in
-    gsp_tu10x.bin)    echo 92af243e48c22325568ce24ef2edf5fa257b9bacc10a18fd38342cddeaf83fd8;;
-    gsp_ga10x.bin)    echo 26a32926507e19e8c92911ed6a9b7981c9699c7a10bb78cc76b4f4abcbff84b6;;
-    ucodes_tu10x.bin) echo db482009e834e26e901bfdf1f3428d1ab54b59b645ea9b987d0f6f14f4567a4f;;
-    ucodes_ga10x.bin) echo b8f3d94d33cc284da4e0b758f069271818694b2ce8b50769d6a14b46df5d3cbf;;
+    gsp_tu10x.bin)    echo 29e794f2826c441390a24d92b65476e18000e256a036b075a98b14002fc4693d;;
+    gsp_ga10x.bin)    echo db14c665049472a75bc2f1f1ba8f96345da76188aa9debc287c694445a3f19f2;;
+    ucodes_tu10x.bin) echo ea49202bbab8edd513d532d6b6c5ca1d88475311fb224e0ac9bdba61035060b5;;
+    ucodes_ga10x.bin) echo bbd68cb1b51f074e2d91107ed3dd10e813bbeadc6947859690f92331625cf58c;;
     *) echo none;;
   esac
 }

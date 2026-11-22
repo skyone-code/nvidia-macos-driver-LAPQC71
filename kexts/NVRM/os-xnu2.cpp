@@ -28,12 +28,12 @@
 // root-owned and not group- or world-writable.
 // NVIDIA's GSP firmware must be the exact release the RM was built from; this directory names it (the package ships
 // nvfw/nvidia/<version>/, and older versions stay beside it for a rollback).
-#define NV_XNU_FW_DIR "/Library/NullMoth/nvfw/nvidia/620.70.06/"
+#define NV_XNU_FW_DIR "/Library/NullMoth/nvfw/nvidia/620.73.04/"
 // Fallback for an early start: /Library is firmlinked to the Data volume, so NV_XNU_FW_DIR does not
 // exist yet when this driver is loaded from the boot collection. /usr/share lives on the system
 // volume and is not firmlinked. Same layout underneath, so only the prefix differs. See the
 // firmlink note in nv_get_firmware.
-#define NV_XNU_FW_ALT_DIR "/usr/share/nvfw/nvidia/620.70.06/"
+#define NV_XNU_FW_ALT_DIR "/usr/share/nvfw/nvidia/620.73.04/"
 // The largest image we ship is the Ampere ucodes at 56 MB (620.70.06, measured); the cap only has to be generous.
 #define NV_XNU_FW_MAX_BYTES (256u * 1024u * 1024u)
 #define NV_FIRMWARE_FOR_NAME(name) NV_XNU_FW_DIR name ".bin"
@@ -1210,11 +1210,11 @@ NV_STATUS NV_API_CALL nv_dma_unmap_alloc(nv_dma_device_t *dev, NvU64 page_count,
 // the card's own secure boot is what decides whether an image may run.
 struct nv_xnu_fw_expected { const char *name; NvU64 bytes; const char *sha1; };
 static const nv_xnu_fw_expected nv_xnu_fw_set[] = {
-    // NVIDIA 620.70.06 (NV_XNU_FW_DIR above); these move together with that directory on every NVIDIA update
-    { "gsp_ga10x.bin",    18266264ull, "6af82922e1a09b7dc4a8ce4c321fbb9d2f81894b" },
-    { "gsp_tu10x.bin",    16692112ull, "e16ff38dd2f9db6958b02dea4582dc5dff9b21cc" },
-    { "ucodes_ga10x.bin", 56128512ull, "62e74fcdd2c22765993a36a796cec536eb2eed4b" },
-    { "ucodes_tu10x.bin", 12532480ull, "5ccef0d210a2cdc1f1a1becb3ff50dbad19c332b" },
+    // NVIDIA 620.73.04 (NV_XNU_FW_DIR above); these move together with that directory on every NVIDIA update
+    { "gsp_ga10x.bin",    18278552ull, "f42795645d98f8ce1beb5d13160f69cdb651fc33" },
+    { "gsp_tu10x.bin",    16700304ull, "62e6c3332d947152c3c58430e01dfc3ccdc69632" },
+    { "ucodes_ga10x.bin", 56128512ull, "dc526d3f3a98e6e08722c09a04b5e40b44176266" },
+    { "ucodes_tu10x.bin", 12532480ull, "6b8d1859ff0e86007f052d87aa5f7c3c1da815ec" },
 };
 static const nv_xnu_fw_expected *nv_xnu_fw_expect(const char *path)
 {
