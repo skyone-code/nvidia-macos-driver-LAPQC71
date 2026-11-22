@@ -1,0 +1,341 @@
+--- a/interface/nvkms-api.h
++++ b/interface/nvkms-api.h
+@@ -248,6 +248,7 @@
+     NVKMS_IOCTL_ACQUIRE_PERMISSIONS,
+     NVKMS_IOCTL_REVOKE_PERMISSIONS,
+     NVKMS_IOCTL_QUERY_DPY_CRC32,
++    NVKMS_IOCTL_QUERY_HEAD_HW_STATE,
+     NVKMS_IOCTL_REGISTER_DEFERRED_REQUEST_FIFO,
+     NVKMS_IOCTL_UNREGISTER_DEFERRED_REQUEST_FIFO,
+     NVKMS_IOCTL_ALLOC_SWAP_GROUP,
+@@ -3719,6 +3720,51 @@
+ struct NvKmsQueryDpyCRC32Params {
+     struct NvKmsQueryDpyCRC32Request request; /*! in */
+     struct NvKmsQueryDpyCRC32Reply reply;     /*! out */
++};
++
++/*!
++ * NVKMS_IOCTL_QUERY_HEAD_HW_STATE
++ *
++ * Debug snapshot of one api head's EVO state as NVKMS sees it.  Lets a caller
++ * tell apart "the head is not active" from "the head is active and its
++ * compositor is scanning, but the connector's output resource was never
++ * programmed", which otherwise look identical from the framebuffer (accepted
++ * modeset, frozen encoder output).
++ */
++
++struct NvKmsQueryHeadHwStateRequest {
++    NvKmsDeviceHandle deviceHandle;
++    NvKmsDispHandle dispHandle;
++    NvU32 head;
++};
++
++struct NvKmsQueryHeadHwStateReply {
++    /*! apiHeadState: activeDpys non-empty, i.e. nvApiHeadIsActive() */
++    NvU8 headActive;
++    /*! headState: pConnectorEvo != NULL, i.e. nvHeadIsActive() */
++    NvU8 connectorDriven;
++    /*! connector->or.type / or.protocol (0xff if no connector driven) */
++    NvU8 orType;
++    NvU8 orProtocol;
++    /*! connector active per nvIsConnectorActiveEvo() (primary OR owned) */
++    NvU8 connectorActive;
++    /*! connector OR mask and the head mask owning the primary OR */
++    NvU32 orMask;
++    NvU32 orOwnerHeadMask;
++    /*! apiHeadState: hardware heads mapped onto this api head */
++    NvU32 hwHeadsMask;
++    /*! apiHeadState: activeDpys as an opaque mask (nvDpyIdListToNvU32) */
++    NvU32 activeDpysMask;
++    /*! headState: nonzero only while a mode is being driven by this head */
++    NvU32 activeRmId;
++    /*! headState: color format / display rate the head is driving */
++    NvU32 colorFormat;
++    NvU32 displayRate;
++};
++
++struct NvKmsQueryHeadHwStateParams {
++    struct NvKmsQueryHeadHwStateRequest request; /*! in */
++    struct NvKmsQueryHeadHwStateReply reply;     /*! out */
+ };
+ 
+ /*!
+--- a/src/nvkms.c
++++ b/src/nvkms.c
+@@ -3735,9 +3735,74 @@
+ 
+         if (!nvReadCRC32Evo(pDispEvo, head, &crcOut)) {
+             return FALSE;
++        }
++    }
++
++    return TRUE;
++}
++
++/*
++ * Debug snapshot of one api head's EVO state.  See NvKmsQueryHeadHwStateReply
++ * in nvkms-api.h for what each field means and why it exists: with a
++ * dynamically-connected display the head can be active (activeDpys non-empty,
++ * compositor scanning changing frames) while its connector's output resource
++ * was never programmed -- which from the framebuffer looks exactly like an
++ * accepted modeset with a frozen encoder.
++ */
++static NvBool QueryHeadHwState(struct NvKmsPerOpen *pOpen,
++                               void *pParamsVoid)
++{
++    struct NvKmsQueryHeadHwStateParams *pParams = pParamsVoid;
++
++    struct NvKmsPerOpenDev *pOpenDev =
++        GetPerOpenDev(pOpen, pParams->request.deviceHandle);
++    if (pOpenDev == NULL) {
++        return FALSE;
++    }
++
++    NVDispEvoPtr pDispEvo = pOpenDev->pDevEvo->pDispEvo[0];
++
++    if (!nvKmsOpenDevHasSubOwnerPermissionOrBetter(pOpenDev)) {
++        return FALSE;
++    }
++
++    const NvU32 apiHead = pParams->request.head;
++    if (apiHead >= ARRAY_LEN(pDispEvo->apiHeadState)) {
++        return FALSE;
++    }
++
++    nvkms_memset(&(pParams->reply), 0, sizeof(pParams->reply));
++
++    const NVDpyIdList activeDpys =
++        pDispEvo->apiHeadState[apiHead].activeDpys;
++
++    pParams->reply.headActive = !nvDpyIdListIsEmpty(activeDpys);
++    pParams->reply.activeDpysMask = nvDpyIdListToNvU32(activeDpys);
++    pParams->reply.hwHeadsMask =
++        pDispEvo->apiHeadState[apiHead].hwHeadsMask;
++
++    const NVConnectorEvoPtr pConnectorEvo =
++        pDispEvo->headState[apiHead].pConnectorEvo;
++
++    pParams->reply.connectorDriven = (pConnectorEvo != NULL);
++
++    if (pConnectorEvo != NULL) {
++        pParams->reply.orType = (NvU8)pConnectorEvo->or.type;
++        pParams->reply.orProtocol = (NvU8)pConnectorEvo->or.protocol;
++        pParams->reply.orMask = nvConnectorGetORMaskEvo(pConnectorEvo);
++        pParams->reply.connectorActive = nvIsConnectorActiveEvo(pConnectorEvo);
++        if ((pConnectorEvo->or.primary != NV_INVALID_OR) &&
++            (pConnectorEvo->or.primary < 32)) {
++            pParams->reply.orOwnerHeadMask =
++                pConnectorEvo->or.ownerHeadMask[pConnectorEvo->or.primary];
+         }
+     }
+ 
++    pParams->reply.activeRmId = pDispEvo->headState[apiHead].activeRmId;
++    pParams->reply.colorFormat =
++        (NvU32)pDispEvo->headState[apiHead].procAmp.colorFormat;
++    pParams->reply.displayRate = pDispEvo->headState[apiHead].displayRate;
++
+     return TRUE;
+ }
+ 
+@@ -4970,6 +5035,7 @@
+         ENTRY(NVKMS_IOCTL_ACQUIRE_PERMISSIONS, AcquirePermissions),
+         ENTRY(NVKMS_IOCTL_REVOKE_PERMISSIONS, RevokePermissions),
+         ENTRY(NVKMS_IOCTL_QUERY_DPY_CRC32, QueryDpyCRC32),
++        ENTRY(NVKMS_IOCTL_QUERY_HEAD_HW_STATE, QueryHeadHwState),
+         ENTRY(NVKMS_IOCTL_REGISTER_DEFERRED_REQUEST_FIFO,
+               RegisterDeferredRequestFifo),
+         ENTRY(NVKMS_IOCTL_UNREGISTER_DEFERRED_REQUEST_FIFO,
+--- a/kapi/interface/nvkms-kapi.h
++++ b/kapi/interface/nvkms-kapi.h
+@@ -528,6 +528,28 @@
+     struct NvKmsKapiDpyCRC32 outputCrc32;
+ };
+ 
++/*!
++ * Debug snapshot of one api head's EVO state, fetched through
++ * NVKMS_IOCTL_QUERY_HEAD_HW_STATE.  Lets a client tell apart "the head is not
++ * active" from "the head is active and scanning, but its connector's output
++ * resource was never programmed" -- with a dynamically-connected display both
++ * look identical from the framebuffer (accepted modeset, frozen encoder).
++ */
++struct NvKmsKapiHeadHwState {
++    NvBool headActive;      /*!< apiHeadState.activeDpys non-empty */
++    NvBool connectorDriven; /*!< headState.pConnectorEvo != NULL */
++    NvBool connectorActive; /*!< primary OR owned by a head */
++    NvU8 orType;            /*!< connector->or.type (0xff if none) */
++    NvU8 orProtocol;        /*!< connector->or.protocol */
++    NvU32 orMask;           /*!< connector OR mask */
++    NvU32 orOwnerHeadMask;  /*!< head mask owning the primary OR */
++    NvU32 hwHeadsMask;      /*!< hardware heads mapped to this api head */
++    NvU32 activeDpysMask;   /*!< activeDpys as an opaque mask */
++    NvU32 activeRmId;       /*!< nonzero only while a mode is driven */
++    NvU32 colorFormat;      /*!< color format the head drives */
++    NvU32 displayRate;      /*!< display rate the head drives */
++};
++
+ struct NvKmsKapiEvent {
+     enum NvKmsEventType type;
+ 
+@@ -1317,6 +1339,31 @@
+         struct NvKmsKapiCrcs *crc32
+     );
+ 
++    /*!
++     * Debug: snapshot of the given head's EVO state.  See
++     * NvKmsKapiHeadHwState for the fields.
++     *
++     * \return NV_TRUE on success, NV_FALSE on failure.
++     */
++    NvBool (*getHeadHwState)
++    (
++        struct NvKmsKapiDevice *device,
++        NvU32 head,
++        struct NvKmsKapiHeadHwState *state
++    );
++
++    /*!
++     * Debug: how many of each display event reached kapi's event dispatcher
++     * since driver load.  Counts are never reset.
++     */
++    void (*getEventCounters)
++    (
++        NvU32 *dpyChanged,
++        NvU32 *dynamicDpyConnected,
++        NvU32 *flipOccurred,
++        NvU32 *total
++    );
++
+      /*!
+      * Get the list allocation pages corresponding to the specified memory object.
+      *
+--- a/kapi/src/nvkms-kapi.c
++++ b/kapi/src/nvkms-kapi.c
+@@ -4016,6 +4016,17 @@
+     }
+ 
+     return KmsFlip(device, requestedConfig, replyConfig, commit);
++}
++
++/* Debug counters: display events that reached kapi's dispatcher (never reset). */
++static volatile NvU32 sKapiEvtDpyChanged;
++static volatile NvU32 sKapiEvtDynDpyConnected;
++static volatile NvU32 sKapiEvtFlipOccurred;
++static volatile NvU32 sKapiEvtTotal;
++
++static inline void kapiEvtCount(volatile NvU32 *counter)
++{
++    __sync_add_and_fetch(counter, 1);
+ }
+ 
+ /*
+@@ -4054,12 +4065,14 @@
+         }
+ 
+         kapiEvent.type = kmsEventParams.reply.event.eventType;
++        kapiEvtCount(&sKapiEvtTotal);
+ 
+         kapiEvent.device = device;
+         kapiEvent.privateData = device->privateData;
+ 
+         switch (kmsEventParams.reply.event.eventType) {
+             case NVKMS_EVENT_TYPE_DPY_CHANGED:
++                kapiEvtCount(&sKapiEvtDpyChanged);
+                 kapiEvent.u.displayChanged.display =
+                     nvDpyIdToNvU32(kmsEventParams.
+                                    reply.event.u.dpyChanged.dpyId);
+@@ -4079,11 +4092,13 @@
+                     kmsEventParams.reply.event.u.dpyCpTopologyChanged.topology;
+                 break;
+             case NVKMS_EVENT_TYPE_DYNAMIC_DPY_CONNECTED:
++                kapiEvtCount(&sKapiEvtDynDpyConnected);
+                 kapiEvent.u.dynamicDisplayConnected.display =
+                     nvDpyIdToNvU32(kmsEventParams.
+                                    reply.event.u.dynamicDpyConnected.dpyId);
+                 break;
+             case NVKMS_EVENT_TYPE_FLIP_OCCURRED:
++                kapiEvtCount(&sKapiEvtFlipOccurred);
+                 kapiEvent.u.flipOccurred.head =
+                     kmsEventParams.reply.event.u.flipOccurred.head;
+                 kapiEvent.u.flipOccurred.layer =
+@@ -4153,6 +4168,72 @@
+     return NV_TRUE;
+ }
+ 
++static void GetEventCounters
++(
++    NvU32 *dpyChanged,
++    NvU32 *dynamicDpyConnected,
++    NvU32 *flipOccurred,
++    NvU32 *total
++)
++{
++    if (dpyChanged != NULL) {
++        *dpyChanged = sKapiEvtDpyChanged;
++    }
++    if (dynamicDpyConnected != NULL) {
++        *dynamicDpyConnected = sKapiEvtDynDpyConnected;
++    }
++    if (flipOccurred != NULL) {
++        *flipOccurred = sKapiEvtFlipOccurred;
++    }
++    if (total != NULL) {
++        *total = sKapiEvtTotal;
++    }
++}
++
++static NvBool GetHeadHwState
++(
++    struct NvKmsKapiDevice *device,
++    NvU32 head,
++    struct NvKmsKapiHeadHwState *state
++)
++{
++    struct NvKmsQueryHeadHwStateParams params = { };
++    NvBool status;
++
++    if (device->hKmsDevice == 0x0) {
++        return NV_FALSE;
++    }
++
++    params.request.deviceHandle = device->hKmsDevice;
++    params.request.dispHandle   = device->hKmsDisp;
++    params.request.head         = head;
++
++    status = nvkms_ioctl_from_kapi(device->pKmsOpen,
++                                   NVKMS_IOCTL_QUERY_HEAD_HW_STATE,
++                                   &params, sizeof(params));
++
++    if (!status) {
++        nvKmsKapiLogDeviceDebug(device, "NVKMS QueryHeadHwState failed.");
++        return NV_FALSE;
++    }
++
++    state->headActive      = params.reply.headActive;
++    state->connectorDriven = params.reply.connectorDriven;
++    state->connectorActive = params.reply.connectorActive;
++    state->orType          = params.reply.orType;
++    state->orProtocol      = params.reply.orProtocol;
++    state->orMask          = params.reply.orMask;
++    state->orOwnerHeadMask = params.reply.orOwnerHeadMask;
++    state->hwHeadsMask     = params.reply.hwHeadsMask;
++    state->activeDpysMask  = params.reply.activeDpysMask;
++    state->activeRmId      = params.reply.activeRmId;
++    state->colorFormat     = params.reply.colorFormat;
++    state->displayRate     = params.reply.displayRate;
++
++    return NV_TRUE;
++}
++
++
+ static const struct NvKmsKapiCallbacks *pCallbacks;
+ 
+ void nvKmsKapiSuspendResume
+@@ -4403,6 +4484,8 @@
+     funcsTable->freeChannelEvent = nvKmsKapiFreeChannelEvent;
+ 
+     funcsTable->getCRC32 = GetCRC32;
++    funcsTable->getHeadHwState = GetHeadHwState;
++    funcsTable->getEventCounters = GetEventCounters;
+ 
+     funcsTable->getMemoryPages = GetMemoryPages;
+     funcsTable->freeMemoryPages = FreeMemoryPages;

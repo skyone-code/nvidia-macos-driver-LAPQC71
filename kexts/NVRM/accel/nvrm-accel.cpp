@@ -2255,6 +2255,50 @@ SYSCTL_PROC(_debug, OID_AUTO, nvaccel_crc_out, CTLTYPE_INT | CTLFLAG_RD | CTLFLA
 static int nvaccel_crcsup_sysctl SYSCTL_HANDLER_ARGS;
 SYSCTL_PROC(_debug, OID_AUTO, nvaccel_crc_sup, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, nvaccel_crcsup_sysctl, "I",
             "b85k-crc: bitmask of CRC sources this head supports (1 compositor, 2 output, 4 query failed)");
+
+// ---- head hardware-state debug (ogkm patch 630-head-hwstate-debug) --------
+// One reader, many names: each oid's arg2 selects the field.  Head fields
+// come from the head nvaccel_crc_head selects; the counters are kapi-global
+// (display events that reached kapi's dispatcher since load).
+enum {
+    kHsHeadActive = 0, kHsConnDriven, kHsConnActive, kHsOrType, kHsOrProto,
+    kHsOrMask, kHsOwnerHead, kHsHwHeads, kHsDpys, kHsRmId, kHsFmt, kHsRate,
+    kEvtDpyChanged, kEvtDynConn, kEvtFlip, kEvtTotal,
+};
+static int nvaccel_headstate_sysctl SYSCTL_HANDLER_ARGS;
+SYSCTL_PROC(_debug, OID_AUTO, nvaccel_hs_active, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, 0, kHsHeadActive, nvaccel_headstate_sysctl, "I",
+            "head hwstate: 1 = api head active (activeDpys non-empty)");
+SYSCTL_PROC(_debug, OID_AUTO, nvaccel_hs_conn, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, 0, kHsConnDriven, nvaccel_headstate_sysctl, "I",
+            "head hwstate: 1 = headState.pConnectorEvo != NULL (head drives a connector)");
+SYSCTL_PROC(_debug, OID_AUTO, nvaccel_hs_connact, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, 0, kHsConnActive, nvaccel_headstate_sysctl, "I",
+            "head hwstate: 1 = the connector's primary OR is owned by a head");
+SYSCTL_PROC(_debug, OID_AUTO, nvaccel_hs_ortype, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, 0, kHsOrType, nvaccel_headstate_sysctl, "I",
+            "head hwstate: connector or.type (NV0073_CTRL_SPECIFIC_OR_TYPE_*, 0xff = none)");
+SYSCTL_PROC(_debug, OID_AUTO, nvaccel_hs_orproto, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, 0, kHsOrProto, nvaccel_headstate_sysctl, "I",
+            "head hwstate: connector or.protocol (NV0073_CTRL_SPECIFIC_OR_PROTOCOL_*, 0xff = none)");
+SYSCTL_PROC(_debug, OID_AUTO, nvaccel_hs_ormask, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, 0, kHsOrMask, nvaccel_headstate_sysctl, "I",
+            "head hwstate: connector OR mask (0 = no OR assigned -- encoder cannot run)");
+SYSCTL_PROC(_debug, OID_AUTO, nvaccel_hs_owner, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, 0, kHsOwnerHead, nvaccel_headstate_sysctl, "I",
+            "head hwstate: head mask owning the connector's primary OR");
+SYSCTL_PROC(_debug, OID_AUTO, nvaccel_hs_hwhm, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, 0, kHsHwHeads, nvaccel_headstate_sysctl, "I",
+            "head hwstate: hwHeadsMask of the api head");
+SYSCTL_PROC(_debug, OID_AUTO, nvaccel_hs_dpys, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, 0, kHsDpys, nvaccel_headstate_sysctl, "I",
+            "head hwstate: activeDpys opaque mask");
+SYSCTL_PROC(_debug, OID_AUTO, nvaccel_hs_rmid, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, 0, kHsRmId, nvaccel_headstate_sysctl, "I",
+            "head hwstate: activeRmId (nonzero only while a mode is being driven by this head)");
+SYSCTL_PROC(_debug, OID_AUTO, nvaccel_hs_fmt, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, 0, kHsFmt, nvaccel_headstate_sysctl, "I",
+            "head hwstate: colorFormat the head drives");
+SYSCTL_PROC(_debug, OID_AUTO, nvaccel_hs_rate, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, 0, kHsRate, nvaccel_headstate_sysctl, "I",
+            "head hwstate: display rate the head drives");
+SYSCTL_PROC(_debug, OID_AUTO, nvaccel_evt_dpych, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, 0, kEvtDpyChanged, nvaccel_headstate_sysctl, "I",
+            "kapi events: NVKMS_EVENT_TYPE_DPY_CHANGED count");
+SYSCTL_PROC(_debug, OID_AUTO, nvaccel_evt_dynconn, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, 0, kEvtDynConn, nvaccel_headstate_sysctl, "I",
+            "kapi events: NVKMS_EVENT_TYPE_DYNAMIC_DPY_CONNECTED count");
+SYSCTL_PROC(_debug, OID_AUTO, nvaccel_evt_flip, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, 0, kEvtFlip, nvaccel_headstate_sysctl, "I",
+            "kapi events: NVKMS_EVENT_TYPE_FLIP_OCCURRED count");
+SYSCTL_PROC(_debug, OID_AUTO, nvaccel_evt_total, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, 0, kEvtTotal, nvaccel_headstate_sysctl, "I",
+            "kapi events: all display events that reached kapi's dispatcher");
+
 static bool gSysctlInstalled = false;
 static void nvaccelInstallSysctl(void)
 {
@@ -2295,6 +2339,14 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvaccel_crc_head);       sysctl_register_oid(&sysctl__debug_nvaccel_crc);
     sysctl_register_oid(&sysctl__debug_nvaccel_crc_comp);       sysctl_register_oid(&sysctl__debug_nvaccel_crc_out);
     sysctl_register_oid(&sysctl__debug_nvaccel_crc_sup);
+    sysctl_register_oid(&sysctl__debug_nvaccel_hs_active);      sysctl_register_oid(&sysctl__debug_nvaccel_hs_conn);
+    sysctl_register_oid(&sysctl__debug_nvaccel_hs_connact);     sysctl_register_oid(&sysctl__debug_nvaccel_hs_ortype);
+    sysctl_register_oid(&sysctl__debug_nvaccel_hs_orproto);     sysctl_register_oid(&sysctl__debug_nvaccel_hs_ormask);
+    sysctl_register_oid(&sysctl__debug_nvaccel_hs_owner);       sysctl_register_oid(&sysctl__debug_nvaccel_hs_hwhm);
+    sysctl_register_oid(&sysctl__debug_nvaccel_hs_dpys);        sysctl_register_oid(&sysctl__debug_nvaccel_hs_rmid);
+    sysctl_register_oid(&sysctl__debug_nvaccel_hs_fmt);         sysctl_register_oid(&sysctl__debug_nvaccel_hs_rate);
+    sysctl_register_oid(&sysctl__debug_nvaccel_evt_dpych);      sysctl_register_oid(&sysctl__debug_nvaccel_evt_dynconn);
+    sysctl_register_oid(&sysctl__debug_nvaccel_evt_flip);       sysctl_register_oid(&sysctl__debug_nvaccel_evt_total);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_hit);   sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_miss);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_async);      sysctl_register_oid(&sysctl__debug_nvaccel_iop_async_flips);
     { extern struct sysctl_oid sysctl__debug_nvaccel_svdiag; sysctl_register_oid(&sysctl__debug_nvaccel_svdiag); }
@@ -3059,6 +3111,65 @@ static bool nvaccelReadCrcs(struct NvKmsKapiCrcs *c)
     if (!k || !k->getCRC32 || gCrcHead < 0 || gCrcHead >= 8) return false;
     if (!nvAccelRmHandles(NVAccel::forDisplay(), &h) || !h.kapiDevice) return false;
     return k->getCRC32((struct NvKmsKapiDevice *)h.kapiDevice, (NvU32)gCrcHead, c) ? true : false;
+}
+static struct NvKmsKapiFunctionsTable *nvaccelKapiTable(void)
+{
+    NVAccel *a = NVAccel::forDisplay();
+    IOService *fb = a ? a->fFB : nullptr;
+    IOService *nub = fb ? fb->getProvider() : nullptr;
+    struct NVRMDisplayPointers displayPtrs = {};
+    displayPtrs.version = NVRM_DISPLAY_PTRS_ABI_VERSION;
+    if (nub) {
+        const OSSymbol *displayPtrsFn = OSSymbol::withCString(NVRM_DISPLAY_PTRS_FN);
+        if (displayPtrsFn) { nub->callPlatformFunction(displayPtrsFn, false, &displayPtrs, NULL, NULL, NULL); displayPtrsFn->release(); }
+    }
+    return (struct NvKmsKapiFunctionsTable *)displayPtrs.kapi;
+}
+// Reads the debug head-state snapshot for gCrcHead (ogkm patch 630). Returns false when the query itself
+// failed, so a handler can tell "head dead" apart from "the driver could not ask".
+static bool nvaccelReadHeadState(struct NvKmsKapiHeadHwState *s)
+{
+    nvSVZero(s, sizeof *s);
+    struct NvKmsKapiFunctionsTable *k = nvaccelKapiTable();
+    struct NVRMRmHandles h; nvSVZero(&h, sizeof h);
+    if (!k || !k->getHeadHwState || gCrcHead < 0 || gCrcHead >= 8) return false;
+    if (!nvAccelRmHandles(NVAccel::forDisplay(), &h) || !h.kapiDevice) return false;
+    return k->getHeadHwState((struct NvKmsKapiDevice *)h.kapiDevice, (NvU32)gCrcHead, s) ? true : false;
+}
+static int nvaccel_headstate_sysctl SYSCTL_HANDLER_ARGS
+{
+    int out = 0;
+    const int field = arg2;
+    if (field <= kHsRate) {
+        struct NvKmsKapiHeadHwState s;
+        if (nvaccelReadHeadState(&s)) {
+            switch (field) {
+                case kHsHeadActive:  out = s.headActive ? 1 : 0; break;
+                case kHsConnDriven:  out = s.connectorDriven ? 1 : 0; break;
+                case kHsConnActive:  out = s.connectorActive ? 1 : 0; break;
+                case kHsOrType:      out = s.orType; break;
+                case kHsOrProto:     out = s.orProtocol; break;
+                case kHsOrMask:      out = (int)s.orMask; break;
+                case kHsOwnerHead:   out = (int)s.orOwnerHeadMask; break;
+                case kHsHwHeads:     out = (int)s.hwHeadsMask; break;
+                case kHsDpys:        out = (int)s.activeDpysMask; break;
+                case kHsRmId:        out = (int)s.activeRmId; break;
+                case kHsFmt:         out = (int)s.colorFormat; break;
+                case kHsRate:        out = (int)s.displayRate; break;
+            }
+        }
+    } else {
+        NvU32 dpyChanged = 0, dynConn = 0, flip = 0, total = 0;
+        struct NvKmsKapiFunctionsTable *k = nvaccelKapiTable();
+        if (k && k->getEventCounters) k->getEventCounters(&dpyChanged, &dynConn, &flip, &total);
+        switch (field) {
+            case kEvtDpyChanged: out = (int)dpyChanged; break;
+            case kEvtDynConn:    out = (int)dynConn; break;
+            case kEvtFlip:       out = (int)flip; break;
+            case kEvtTotal:      out = (int)total; break;
+        }
+    }
+    return sysctl_handle_int(oidp, &out, 0, req);
 }
 static int nvaccel_crc_sysctl SYSCTL_HANDLER_ARGS
 {

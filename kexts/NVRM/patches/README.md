@@ -32,3 +32,15 @@ poll event in `kern_fsp.c`. `tools/test_patch_chain.sh` runs the whole chain aga
 
 The check is `tools/test_patch_chain.py` (SKIP without a pristine tree) and an optional step of `build/build_nvrm.sh`:
 `NVRM_PRISTINE_OGKM=<pristine 620.70.06 tree> bash build/build_nvrm.sh ...` stops before building if any patch no longer applies.
+
+`630-head-hwstate-debug.patch` applies to `interface/nvkms-api.h`, `src/nvkms.c`, `kapi/interface/nvkms-kapi.h` and
+`kapi/src/nvkms-kapi.c` of NVIDIA 620.70.06 with the patches above already applied. It adds one debug ioctl
+(`NVKMS_IOCTL_QUERY_HEAD_HW_STATE`) that snapshots an api head's EVO state -- head active, connector driven, OR
+assignment (type/protocol/mask/owner), hwHeadsMask, activeDpys, activeRmId, color format and display rate -- plus
+two kapi function-table entries (`getHeadHwState`, `getEventCounters`) and kapi-side counters for the display
+events that reach the event dispatcher (dpy-changed, dynamic-dpy-connected, flip-occurred). NVAccel exposes all of
+it as `debug.nvaccel_hs_*` and `debug.nvaccel_evt_*` sysctls; `tools/nv-scene.sh` samples them as extra columns.
+Purpose: with a dynamically-connected display, an accepted modeset with a frozen encoder looks identical whether
+the head is inactive or active-but-never-programmed; the CRC query path refuses inactive heads, so a successful
+CRC read plus a frozen output CRC already proves "active compositor, dead SOR" -- these counters pin down which
+stage owns the break and whether disconnect events are being delivered at all (the unplug leak symptom).
