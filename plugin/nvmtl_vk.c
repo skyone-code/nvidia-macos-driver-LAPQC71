@@ -429,6 +429,69 @@ static int g_a2one;
 static int g_depth_bounds;   /* the depthBounds feature: Metal's setDepthTestMinBound:maxBound: */
 static int g_dual;
 static int g_cap_f32_filter, g_cap_f32_msaa, g_cap_pull;   // MTLDevice capability answers decided from the bits queried at device creation (nvmtl_caps_query.h)
+/* caps cache: Metal's _MTLDeviceFeatureQueries asks supports32BitMSAA / supports32BitFloatFiltering /
+   supportsPullModelInterpolation / supportsQueryTextureLOD / ray-tracing / barycentrics while the device
+   is being registered - before any real GPU work exists. Answering those from a tiny on-disk snapshot
+   lets the ~390ms Mesa load (dlopen of libvulkan_nouveau, measured, static-initializer dominated) be
+   deferred to the first command-queue / render-pipeline creation instead of every device touch. The
+   snapshot is keyed to the vk library's size+mtime so a driver update invalidates it, written once per
+   user per library revision, read by every later process at device-init time in microseconds. */
+static int g_caps_cached;   /* snapshot loaded: the answers below are trustworthy without vk being up */
+static int g_cap_rt_snap = -1, g_cap_bary_snap = -1;
+static uint64_t g_cap_maxbuflen_snap;
+int nvmtl_caps_cached(void) { return g_caps_cached; }
+uint64_t nvmtl_caps_maxbuflen_snap(void) { return g_cap_maxbuflen_snap; }
+typedef struct { uint32_t magic, version; uint64_t libsize, libmtime; int32_t f32f, f32m, pull, rt, bary; char devname[128]; uint64_t maxbuflen; } nvmtl_caps_file;
+#define NVMTL_CAPS_MAGIC 0x4E564350u  /* 'NVCP' */
+#define NVMTL_CAPS_VERSION 3
+static void nvmtl_caps_cache_path(char *out, size_t n) {
+    const char *home = getenv("HOME");
+    if (home && *home && access(home, W_OK) == 0) snprintf(out, n, "%s/.cache/nvmtl-caps.bin", home);
+    else { char ucd[PATH_MAX]; size_t m = confstr(_CS_DARWIN_USER_CACHE_DIR, ucd, sizeof ucd);
+           if (m > 0 && m < n) snprintf(out, n, "%snvmtl-caps.bin", ucd);
+           else snprintf(out, n, "/private/tmp/nvmtl-caps-%d.bin", geteuid()); }
+}
+int nvmtl_caps_cache_load(void) {
+    char p[PATH_MAX]; nvmtl_caps_cache_path(p, sizeof p);
+    FILE *f = fopen(p, "rb");
+    if (!f) { nvlog("caps: no cache at %s - the first vk init will write one", p); return 0; }
+    nvmtl_caps_file c; size_t got = fread(&c, 1, sizeof c, f); fclose(f);
+    struct stat st;
+    if (got != sizeof c || c.magic != NVMTL_CAPS_MAGIC || c.version != NVMTL_CAPS_VERSION ||
+        stat(NVMTL_ICD_LIB, &st) != 0 || c.libsize != (uint64_t)st.st_size || c.libmtime != (uint64_t)st.st_mtime) {
+        nvlog("caps: cache at %s is stale or unreadable - full vk init will rewrite it", p); return 0; }
+    g_cap_f32_filter = c.f32f; g_cap_f32_msaa = c.f32m; g_cap_pull = c.pull;
+    g_cap_rt_snap = c.rt; g_cap_bary_snap = c.bary; g_caps_cached = 1;
+    snprintf(g_name, sizeof g_name, "%s", c.devname);   /* the device name answers before vk is up (the router logs it) */
+    g_cap_maxbuflen_snap = c.maxbuflen;
+    nvlog("caps: answers from cache (%s) - Mesa load deferred to first GPU work", p);
+    return 1;
+}
+/* the maxBufferLength answer as it would be given with vk up (same math as -[NVMTLDevice maxBufferLength]) */
+static uint64_t nvmtl_caps_maxbuflen_now(void) {
+    uint64_t range = 0; nvmtl_vk_pubcaps(NULL, NULL, &range, NULL);
+    if (!range) return 0;
+    const uint64_t ws = nvmtl_vk_working_set();
+    uint64_t three_q = ws / 4 * 3;
+    if (!ws) three_q = range;
+    return range < three_q ? range : three_q;
+}
+static void nvmtl_caps_cache_save(void) {
+    struct stat st;
+    if (stat(NVMTL_ICD_LIB, &st) != 0) return;
+    nvmtl_caps_file c = { NVMTL_CAPS_MAGIC, NVMTL_CAPS_VERSION, (uint64_t)st.st_size, (uint64_t)st.st_mtime,
+                          g_cap_f32_filter, g_cap_f32_msaa, g_cap_pull, g_rt, g_bary, "" };
+    snprintf(c.devname, sizeof c.devname, "%s", g_name);
+    c.maxbuflen = nvmtl_caps_maxbuflen_now();
+    char p[PATH_MAX], tmp[PATH_MAX + 24]; nvmtl_caps_cache_path(p, sizeof p);
+    snprintf(tmp, sizeof tmp, "%s.tmp-%d", p, getpid());
+    FILE *f = fopen(tmp, "wb");
+    if (!f) { nvlog("caps: cache write failed (%s)", tmp); return; }
+    if (fwrite(&c, 1, sizeof c, f) == sizeof c && fclose(f) == 0 && rename(tmp, p) == 0)
+        nvlog("caps: cached at %s - later processes skip the Mesa load until first GPU work (maxbuflen %llu MB = range %llu WS %llu)",
+              p, (unsigned long long)(c.maxbuflen >> 20), (unsigned long long)(nvmtl_caps_maxbuflen_now() >> 20), (unsigned long long)(nvmtl_vk_working_set() >> 20));
+    else { fclose(f); unlink(tmp); }
+}
 static int g_wide;
 static PFN_vkCmdSetLineWidth pvkCmdSetLineWidth;
 static int g_pstat;
@@ -1123,7 +1186,7 @@ static int nvmtl_vk_initialize(void)
        though RADV compiles them. GCN 1/2 have no 16-bit ALU and keep shaderFloat16 off: their half modules stay refused,
        which is what keeps ACO from compiling half arithmetic it cannot lower there. A value the user set wins. */
     if (nvmtl_vk_vendor() == 0x1002) setenv("radv_enable_float16_gfx8", "true", 0);
-    g_lib = dlopen(NVMTL_ICD_LIB, RTLD_NOW | RTLD_LOCAL);
+    g_lib = dlopen(NVMTL_ICD_LIB, RTLD_LAZY | RTLD_LOCAL);
     if (g_lib) {
         pvkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)dlsym(g_lib, "vkGetInstanceProcAddr");
         if (!pvkGetInstanceProcAddr)
@@ -1621,6 +1684,9 @@ static int nvmtl_vk_initialize(void)
 
     atomic_store(&g_up_ns, clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW));
     g_state = 1;
+    /* first full init on this machine+vk build: the FeatureQueries answers are cached by the
+       nvmtl_vk_init wrapper once the pthread_once has completed (saving from inside the once
+       would re-enter nvmtl_vk_init through the working-set API and abort) */
     nvlog("vk: UP in this Metal process — \"%s\" api %u.%u.%u, queue family %u", g_name,
           VK_VERSION_MAJOR(pp.apiVersion), VK_VERSION_MINOR(pp.apiVersion), VK_VERSION_PATCH(pp.apiVersion), g_qfam);
     return 0;
@@ -1663,9 +1729,12 @@ static void nvmtl_vk_note_loss(const char *where, int vkresult, long waited_ms)
 }
 int nvmtl_vk_init(void) {
     pthread_once(&g_vk_once, nvmtl_vk_initialize_once);
+    if (g_state == 1) {   /* once completed: safe to read the working set now (vk_init re-entry is impossible) */
+        static int saved; if (!saved) { saved = 1; nvmtl_caps_cache_save(); }
+    }
     return g_state == 1 ? 0 : -1;
 }
-const char *nvmtl_vk_device_name(void) { return g_state == 1 ? g_name : "(vulkan down)"; }
+const char *nvmtl_vk_device_name(void) { return (g_state == 1 || g_caps_cached) ? g_name : "(vulkan down)"; }
 void nvmtl_vk_limits(uint32_t *layers, uint32_t *shared_bytes, uint32_t wg[3], uint32_t *wg_inv, uint32_t *sm) {
     int up = g_state == 1;
     if (layers) *layers = up ? g_lim.maxImageArrayLayers : 0;
@@ -9655,8 +9724,8 @@ void nvmtl_vk_cmd_barrier_c2c(nvk_cmdbuf *c)
                           0, 1, &mb, 0, NULL, 0, NULL);
 }
 
-int nvmtl_vk_rt_available(void) { return nvmtl_vk_init() ? 0 : g_rt; }
-int nvmtl_vk_barycentrics_available(void) { return nvmtl_vk_init() ? 0 : g_bary; }
+int nvmtl_vk_rt_available(void) { if (g_caps_cached) return g_cap_rt_snap; return nvmtl_vk_init() ? 0 : g_rt; }
+int nvmtl_vk_barycentrics_available(void) { if (g_caps_cached) return g_cap_bary_snap; return nvmtl_vk_init() ? 0 : g_bary; }
 
 // The build-time curve description NVK reads from the pNext chain of a box geometry (nvk/curves/nvk_curve.h, same layout).
 #define NVMTL_VK_STRUCTURE_TYPE_NVK_CURVE_GEOMETRY ((VkStructureType)1000999101)

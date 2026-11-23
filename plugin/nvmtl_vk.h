@@ -221,6 +221,9 @@ int  nvmtl_vk_sparse_granularity(uint32_t vkfmt, int is3d, uint32_t samples, uin
 int  nvmtl_vk_cap_float32_filtering(void);   /* MTLDevice capability answers decided from the Vulkan bits (nvmtl_caps_query.h) */
 int  nvmtl_vk_cap_float32_msaa(void);
 int  nvmtl_vk_cap_pull_model(void);
+int  nvmtl_caps_cached(void);                /* caps snapshot loaded from disk: answer without initializing vk */
+int  nvmtl_caps_cache_load(void);            /* call once at device init; 1 = the FeatureQueries answers came from the cache */
+uint64_t nvmtl_caps_maxbuflen_snap(void);    /* cached maxBufferLength answer (0 when the cache predates this field) */
 int  nvmtl_vk_image_create_ms_storage(uint32_t w, uint32_t h, uint32_t vkfmt, uint32_t bpp, uint32_t samples, nvk_image *out);
 int  nvmtl_vk_image_create_ms_full(uint32_t w, uint32_t h, uint32_t vkfmt, uint32_t bpp, uint32_t samples, uint32_t mtl_type, uint32_t layers, nvk_image *out);
 int  nvmtl_vk_depth_create_ms(uint32_t w, uint32_t h, uint32_t vkfmt, uint32_t aspect, uint32_t samples, nvk_image *out);

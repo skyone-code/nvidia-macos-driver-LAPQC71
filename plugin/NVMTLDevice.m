@@ -26,6 +26,11 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <time.h>
+#include <objc/runtime.h>
+#include <objc/message.h>
+#include <mach/mach_time.h>
+extern id objc_retain(id);
+extern void objc_release(id);
 #include "nvmtl_avail.h"
 #include "nvmtl_sample_positions.h"
 #include "nvmtl_log_failure.h"
@@ -162,7 +167,13 @@ static void nvlog_line(const char *t) {
 #else
     syslog(LOG_NOTICE, "NVMTL: %s", t);
 #endif
-    FILE *f = fopen(nvmtl_log_path(), "a"); if (f) { fprintf(f, "pid %d NVMTL: %s\n", getpid(), t); fclose(f); }
+    /* diagnostic: monotonic timestamp per line so slow init steps (vk/GSP bring-up) can be profiled */
+    static mach_timebase_info_data_t tb;
+    static uint64_t base;
+    if (!base) { mach_timebase_info(&tb); base = mach_continuous_time(); }
+    uint64_t now = mach_continuous_time();
+    double ms = (double)((now - base) * tb.numer / tb.denom) / 1e6;
+    FILE *f = fopen(nvmtl_log_path(), "a"); if (f) { fprintf(f, "pid %d NVMTL: [%10.2f ms] %s\n", getpid(), ms, t); fclose(f); }
 }
 
 #define NVMTL_OOM_STREAK      32
@@ -827,8 +838,19 @@ static void nvmtl_keep_device(id dev)
     });
     if (!pin) { nvlog("device %p NOT pinned (NVMTL_KEEP_DEVICE=0) - a dealloc line now means the list went stale", dev); return; }
     @synchronized(gNVMTLDevKeep) { [gNVMTLDevKeep addObject:dev]; }
-    nvlog("device %p pinned for the life of the process (%lu device(s) created here)",
-          dev, (unsigned long)gNVMTLDevKeep.count);
+    {   /* defensive hardening: Metal's device list holds a raw pointer without retaining, so ANY over-release
+           burst (an app's own refcount bookkeeping gone slightly wrong) turns the list entry into a dangling
+           pointer and the next MTLCopyAllDevices - a window creation, a menu, a VideoToolbox registration -
+           segfaults the whole app. The device is MEANT to live for the process lifetime, so inflate its retain
+           count far beyond any plausible over-release burst (observed: ~1200 in a video player teardown).
+           Cost: one-time microseconds. Env override: NVMTL_IMMORTAL_RETAINS (0 restores the old one-pin). */
+        long n = 10000;
+        const char *e = getenv("NVMTL_IMMORTAL_RETAINS");
+        if (e && *e) n = atol(e);
+        for (long i = 0; i < n; i++) objc_retain(dev);
+        nvlog("device %p immortalized (+%ld defensive retains) for the life of the process (%lu device(s) created here)",
+              dev, n, (unsigned long)gNVMTLDevKeep.count);
+    }
 }
 @implementation NVMTLDevice
 @dynamic depth24Stencil8PixelFormatSupported, headless, location, locationNumber, lowPower, maxArgumentBufferSamplerCount, maxTransferRate, peerCount, peerGroupID, peerIndex, registryID, removable, sparseTileSizeInBytes, supportsPlacementSparse;
@@ -1001,10 +1023,13 @@ static id nvmtl_refuse_before_init(id obj)
     nvlog("MTLIOAccelDevice's initWithAcceleratorPort: -> %p", (__bridge void *)self);
     gNVMTLMainDevice = self;
     nvmtl_install_hw_resource_pools(self);
+    nvmtl_caps_cache_load();   /* FeatureQueries answers without the ~390ms Mesa load; a cache miss writes one on the first full vk init */
     [self nvmtlProbeGPUPass];
-    if (nvmtl_vk_init()) {
-        nvlog("  NVK did not come up in this process - refusing to be the Metal device for %s", getprogname());
-        return nil;
+    if (getenv("NVMTL_VK_EAGER")) {   /* eager vk init: off by default — Mesa (~19MB, ~390ms) loads at first real GPU work instead */
+        if (nvmtl_vk_init()) {
+            nvlog("  NVK did not come up in this process - refusing to be the Metal device for %s", getprogname());
+            return nil;
+        }
     }
     nvmtl_gl_caps_enable();
     if (nvmtl_vk_vendor() == 0x1002 || nvmtl_vk_vendor() == 0x8086) nvmtl_nmxvt_register();
@@ -1066,7 +1091,7 @@ static id nvmtl_refuse_before_init(id obj)
     return v;
 }
 - (NSString *)name {
-    static int vk = 0; if (!vk) { vk = 1; nvmtl_vk_init(); }
+    static int vk = 0; if (!vk && !nvmtl_caps_cached()) { vk = 1; nvmtl_vk_init(); }
     const char *vkname = nvmtl_vk_device_name();
     NSString *full = [NSString stringWithUTF8String:(vkname ? vkname : "NVIDIA GPU")];
     NSRange cut = [full rangeOfString:@" (NVK "];
@@ -2645,10 +2670,10 @@ static void nvmtl_log_compute_descriptor(MTLComputePipelineDescriptor *d) {
 - (BOOL)supportsVertexAmplificationCount:(NSUInteger)count { return nvmtl_cap_vertex_amplification((uint32_t)MIN(count, (NSUInteger)UINT32_MAX), nvmtl_vk_multiview_views()); }
 // Each answer is the device's own: the format features, sample counts and shader features queried when the Vulkan device was made
 // (nvmtl_caps_query.h). A device without the bit answers NO.
-- (BOOL)supports32BitFloatFiltering { return nvmtl_vk_init() == 0 && nvmtl_vk_cap_float32_filtering(); }
-- (BOOL)supports32BitMSAA { return nvmtl_vk_init() == 0 && nvmtl_vk_cap_float32_msaa(); }
-- (BOOL)supportsPullModelInterpolation { return nvmtl_vk_init() == 0 && nvmtl_vk_cap_pull_model(); }
-- (BOOL)supportsQueryTextureLOD { return nvmtl_cap_query_texture_lod(nvmtl_vk_init() == 0, 1); }   // the translator lowers OpImageQueryLod
+- (BOOL)supports32BitFloatFiltering { return nvmtl_caps_cached() ? nvmtl_vk_cap_float32_filtering() : (nvmtl_vk_init() == 0 && nvmtl_vk_cap_float32_filtering()); }
+- (BOOL)supports32BitMSAA { return nvmtl_caps_cached() ? nvmtl_vk_cap_float32_msaa() : (nvmtl_vk_init() == 0 && nvmtl_vk_cap_float32_msaa()); }
+- (BOOL)supportsPullModelInterpolation { return nvmtl_caps_cached() ? nvmtl_vk_cap_pull_model() : (nvmtl_vk_init() == 0 && nvmtl_vk_cap_pull_model()); }
+- (BOOL)supportsQueryTextureLOD { return nvmtl_cap_query_texture_lod(nvmtl_caps_cached() || nvmtl_vk_init() == 0, 1); }   // the translator lowers OpImageQueryLod
 // the pipeline builds this driver runs at once (nvmtl_pipeline_compile_width)
 - (NSUInteger)maximumConcurrentCompilationTaskCount { return (NSUInteger)nvmtl_pipeline_compile_width(); }
 - (NSMutableDictionary *)copyIOSurfaceSharedTextureProperties:(MTLTextureDescriptor *)d {
@@ -3103,6 +3128,10 @@ static BOOL nvmtl_family_answer(NSInteger f, BOOL yes, const char *why)
 - (BOOL)supportsSampleCount:(NSUInteger)n { return [self nvmtlSampleCountOK:n]; }
 
 - (NSUInteger)maxBufferLength {
+    if (nvmtl_caps_cached()) {   /* vk deferred: the cached answer computed with vk up on a previous process */
+        uint64_t snap = nvmtl_caps_maxbuflen_snap();
+        if (snap) return (NSUInteger)snap;
+    }
     uint64_t range = 0; nvmtl_vk_pubcaps(NULL, NULL, &range, NULL);
     if (!range) { static int said; if (!said++) nvlog("maxBufferLength: NVK limits unavailable - answering 0 (UNKNOWN)"); return 0; }
     // A zero working set means the budget is UNKNOWN, not that no buffer can be made. maxBufferLength
