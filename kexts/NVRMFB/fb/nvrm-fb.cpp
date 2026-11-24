@@ -182,6 +182,24 @@ static inline bool nvrmPhantomEnabled()
     if (gPhantom < 0) { uint32_t g = 0; gPhantom = (PE_parse_boot_argn("nvfbphantom", &g, sizeof g) && g) ? 1 : 0; }
     return gPhantom == 1;
 }
+// nvfbstandby0 (default 1, Tahoe only): a boot with no NVIDIA display publishes fb0 the way the Tahoe standby
+// framebuffer (the offline fb1 placeholder) is published -- with a fake 4K60 offline mode -- so WindowServer opens
+// it at start-up and builds its display pipe before any hot-plug. The first display plugged in then goes through
+// activateStandby(), a plain mode change on a framebuffer the server already owns, instead of the phantom
+// adoption: an in-place reconfiguration of a framebuffer WindowServer never opened cannot get a display pipe on
+// Tahoe (2026-11-24, the 4K TV sessions: "Unable to find display pipe for IOFB service" -> "Failed to create
+// MTLCommandQueue" -> DisplaySurface::GetMTLTexture raises -> WindowServer aborts, on hot-plug and on a cold
+// boot with the display attached alike, at any resolution). Takes precedence over nvfbphantom; nvfbstandby0=0
+// restores the phantom placeholder.
+static int gStandbyFirst = -1;
+static inline bool nvrmStandbyFirst()
+{
+    if (gStandbyFirst < 0) {
+        uint32_t v = 1;
+        gStandbyFirst = (PE_parse_boot_argn("nvfbstandby0", &v, sizeof v) && !v) ? 0 : 1;
+    }
+    return gStandbyFirst == 1;
+}
 // nvfbredev (default 1): the boot placeholder allocates its NvKmsKapiDevice while this GPU has nothing attached.
 // NVKMS sets the display engine up per device, so that device is initialised with no connected connector. Measured on
 // the black-screen session: a mode set on it is accepted (flipResult 0), the head's input surface carries exactly the
@@ -754,6 +772,11 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     // it as soon as the handler arrives (see connectNotifyFire).
     bool fHotplugStarted = false;
     bool fStandby = false;
+    // The NVKMS device was allocated while this GPU had no display attached (the nvfbstandby0 fb0 and, before it,
+    // the phantom placeholder): NVKMS sets the display engine up per device, so modesets on that device are accepted
+    // but the output stays one black frame -- activateStandby() rebuilds the device before its first modeset, the
+    // same way adoptFirstDisplay() does (nvfbredev).
+    bool fDevBlind = false;
     bool selectInitialMode(NvKmsKapiDisplay display, NvU64 bytes, unsigned alignment,
                            struct NvKmsKapiDisplayMode &mode);
     bool activateStandby();
@@ -1477,7 +1500,8 @@ bool NVRMNVDAFramebuffer::kapiInit()
               "frames are copied to the panel's framebuffer", fPxW, fPxH, fPxPitch);
         return true;
     }
-    if (gNDpy <= 0 && fIndex == 0 && nvrmPhantomEnabled()) {
+    if (gNDpy <= 0 && fIndex == 0 && nvrmPhantomEnabled() &&
+        !(version_major >= 25 && fNumHeads > 0 && nvrmStandbyFirst())) {
         // Nothing connected at boot. Publish anyway so this GPU is in the display list WindowServer builds at start-up;
         // the connection is reported as having no display (fDpyLost) and there is no mode to set, so WindowServer has
         // nothing to composite here until a display appears -- see adoptFirstDisplay().
@@ -1490,11 +1514,20 @@ bool NVRMNVDAFramebuffer::kapiInit()
     if (gNDpy <= 0 || fIndex >= (unsigned)gNDpy) {
         // Keep one offline framebuffer in the boot controller on Tahoe.
         // WindowServer must open it before that controller handles hot-plug.
-        fStandby = version_major >= 25 && gNDpy > 0 && gNDpy == gNDpyBoot &&
-                   fIndex == (unsigned)gNDpy && fIndex < fNumHeads;
+        if (gNDpy <= 0 && fIndex == 0) {
+            // Born displayless: publish index 0 offline with the same fake mode, so WindowServer opens it at
+            // start-up and builds its display pipe -- the first display then arrives through activateStandby()
+            // (a plain modeset on a known framebuffer) instead of the phantom adoption, which cannot get a pipe
+            // on Tahoe (nvfbstandby0, default on; nvfbphantom=1 with nvfbstandby0=0 restores the placeholder).
+            fStandby = version_major >= 25 && fNumHeads > 0 && nvrmStandbyFirst();
+        } else {
+            fStandby = version_major >= 25 && gNDpy > 0 && gNDpy == gNDpyBoot &&
+                       fIndex == (unsigned)gNDpy && fIndex < fNumHeads;
+        }
         fSpareIndex = gNDpy > 0;
         if (!fStandby) return false;
         fDpyLost = true;
+        if (gNDpy <= 0 && fIndex == 0) fDevBlind = true;   // its device was allocated with nothing attached
         // IOGraphics can map this aperture while it is offline. This timing
         // only sizes the allocation and is never submitted to a connector.
         auto &t = fMode.timings;
@@ -1535,7 +1568,7 @@ bool NVRMNVDAFramebuffer::kapiInit()
         FBLOG("no valid mode");
         return false;
     }
-    if (gBootHead < 0 && fIndex == 0) fBootConsole = true;
+    if (!fStandby && gBootHead < 0 && fIndex == 0) fBootConsole = true;
     fKmsMode = fMode; fHaveKmsMode = !fStandby;
     if (!fStandby && gBootHead >= 0 && fDisplay == gBootDpy && (int)fHead == gBootHead &&
         nvrmKmsRasterValid(gBootMode.timings.hVisible, gBootMode.timings.vVisible)) {
@@ -2525,8 +2558,51 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
 bool NVRMNVDAFramebuffer::activateStandby()
 {
     NVRMDisplayGate gate;
-    if (!gate.valid() || !fStandby || fSubmissionFaulted || OSAddAtomic(0, &fStopping) ||
-        fIndex >= (unsigned)gNDpy || !rmGpuReady()) return false;
+    if (!gate.valid() || !fStandby || fSubmissionFaulted || OSAddAtomic(0, &fStopping) || !rmGpuReady()) return false;
+    // A standby framebuffer born with no display attached (nvfbstandby0) allocated its NvKmsKapiDevice while this
+    // GPU had nothing connected: NVKMS brings the display engine up per device, so every mode set on that device
+    // is accepted but the output stays one black frame -- see adoptFirstDisplay(). Throw the device away and
+    // allocate a fresh one, exactly like the phantom adoption does. gDpy was filled from the old device by
+    // hotplugFire, and kapiInit skips its whole enumeration block unless gNDpy is reset, so the fresh device must
+    // run its own enumeration -- which is also what makes its head active (the 07:13 session: without it, flips
+    // are accepted with flipResult 0 but never submitted to EVO).
+    if (fDevBlind && gDev && fDev && nvrmRebuildDeviceEnabled()) {
+        bool sharedWithAnother = false;
+        for (unsigned i = 0; i < sizeof gFBs / sizeof gFBs[0]; i++)
+            if (gFBs[i] && gFBs[i] != this && gFBs[i]->fDev == gDev) { sharedWithAnother = true; break; }
+        if (sharedWithAnother) {
+            FBLOG("standby fb%u: the NVKMS device is shared with another framebuffer -- keeping it (nvfbredev=0 "
+                  "would say the same)", fIndex);
+            fDevBlind = false;
+        } else {
+            IORecursiveLock *sl = startLock();
+            if (sl) IORecursiveLockLock(sl);
+            struct NvKmsKapiSurface *s0 = fSurf, *s1 = fFrontSurf;
+            if (s0) fKms->destroySurface(fDev, s0);
+            if (s1 && s1 != s0) fKms->destroySurface(fDev, s1);
+            fSurf = nullptr; fFrontSurf = nullptr;
+            FBLOG("standby fb%u: rebuilding the NVKMS device -- it was allocated with no display attached, a fresh "
+                  "one initialises the display engine with the display present (nvfbredev)", fIndex);
+            fKms->releaseOwnership(fDev);
+            fKms->freeDevice(fDev);
+            fDev = nullptr; gDev = nullptr;
+            gNDpy = -1;
+            const bool ok = kapiInit();
+            if (sl) IORecursiveLockUnlock(sl);
+            if (!ok || gNDpy <= 0 || fIndex >= (unsigned)gNDpy || !gDpy[fIndex].connected) {
+                // The fresh device has not seen the display yet (its EDID may still be reading): the fresh device
+                // is as displayless as the old one, so stay standby and let the next hotplug scan try again --
+                // the phantom adoption hands the instance back the same way.
+                FBLOG("standby fb%u: the rebuilt device enumerated %d display(s)%s -- staying offline for the next "
+                      "hotplug scan", fIndex, gNDpy, ok ? "" : " (kapiInit failed)");
+                hotplugKick();
+                return false;
+            }
+            fDevBlind = false;
+            setProperty("NVRMDeviceRebuilt", (unsigned long long)1, 32);
+        }
+    }
+    if (fIndex >= (unsigned)gNDpy) return false;
     const auto &sink = gDpy[fIndex];
     if (!sink.connected) return false;
     const NvU32 available = sink.headMask & ~gHeadsTaken;
