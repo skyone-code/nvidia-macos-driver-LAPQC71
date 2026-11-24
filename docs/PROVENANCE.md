@@ -21,14 +21,14 @@ source, which this audit could not fetch, so the owner's statement that none was
 
 | Part | From | Licence | Where recorded |
 |---|---|---|---|
-| Kernel driver core (RM, display engine, user-mode interface headers) | NVIDIA open-gpu-kernel-modules 620.70.06 | MIT (GPL-2.0 alternative not used) | `NOTICE`, `licenses/NVIDIA-open-gpu-kernel-modules-COPYING.txt` |
+| Kernel driver core (RM, display engine, user-mode interface headers) | NVIDIA open-gpu-kernel-modules 620.73.04 | MIT (GPL-2.0 alternative not used) | `NOTICE`, `licenses/NVIDIA-open-gpu-kernel-modules-COPYING.txt` |
 | Display-engine 3D shaders `kexts/NVRM/nvkms_shaders.cpp` | `src/nvidia-modeset/src/shaders/g_*_shaders` of the same tree, xz-compressed unchanged | MIT | file header (was labelled as NullMoth's: corrected) |
 | `nvidia-modeset-os-interface.h` (two copies) | the same tree | MIT, NVIDIA copyright | file header (SPDX said PolyForm: corrected) |
 | Vulkan driver NVK and the NAK compiler | Mesa commit `90a959eb` (26.3.0-rc3) plus `nvk/*.patch` | MIT | `NOTICE`, `licenses/Mesa-license.rst` |
 | Rust crates NAK builds from (proc-macro2, quote, syn, paste and similar, fetched by Mesa's meson wraps) | crates.io | MIT and/or Apache-2.0 | stays with Mesa's tree; see item P8 |
 | Shader translator | `steelbrain/metal2vulkan` (Anees Iqbal) | LGPL-3.0-or-later | `NOTICE`, `translator/LICENSE`, `translator/COPYING` |
 | The Rust crates linked into the translator | crates.io | MIT, Apache-2.0, Unlicense or MIT, Unicode-3.0 | `licenses/translator-rust-crates.txt` (new) |
-| GSP firmware | NVIDIA 620.70.06 driver package, unmodified | NVIDIA "License For Customer Use of NVIDIA Software" | `licenses/NVIDIA-firmware-LICENCE.txt`; fetched on the user's Mac, see P1 (resolved) |
+| GSP firmware | NVIDIA 620.73.04 driver package, unmodified | NVIDIA "License For Customer Use of NVIDIA Software" | `licenses/NVIDIA-firmware-LICENCE.txt`; fetched on the user's Mac, see P1 (resolved) |
 | Intel display firmware (optional, hybrid laptops) | Intel via linux-firmware at commit a42217fc, unmodified, fetched on the user's Mac by `package/dmc_fetch.sh` | Intel i915 firmware licence (binary redistribution unmodified; no reverse engineering) | `licenses/Intel-i915-firmware-LICENSE.txt` |
 | Video encoders and decoders `vendor/nvenc` | `mickys/nvenc` 0.9.5, commit `1e91845` | MIT | `vendor/nvenc/SOURCE`, `licenses/mickys-nvenc-LICENSE.txt` |
 | Headers `libnvencvt` is built against (fetched, not shipped) | NVIDIA open-gpu-kernel-modules 610.57.04, open-gpu-doc `9fdf5c4` (classes/video), WebKit `CMBaseObjectSPI.h` and `VTVideoDecoderSPI.h` | MIT, MIT, BSD | `vendor/nvenc/SOURCE` |
@@ -42,7 +42,7 @@ source, which this audit could not fetch, so the owner's statement that none was
 | `nvmtl-air-dis` in the plugin bundle | NullMoth (`plugin/air_dis.c`), uses `air-runtime` | NullMoth | — |
 
 Downloaded on the user's Mac, never shipped: NVIDIA's DLSS runtimes (SDK 310.9.16, from NVIDIA's GitHub), the NGX core
-(one file from NVIDIA's Linux 620.70.06 package) and `libnvJitLink` (from NVIDIA's PyPI wheel). `package/dlss_fetch.sh` pins
+(one file from NVIDIA's Linux 620.73.04 package) and `libnvJitLink` (from NVIDIA's PyPI wheel). `package/dlss_fetch.sh` pins
 each by SHA-256, asks before downloading, and installs them root-owned. They stay under NVIDIA's licences.
 
 No closed NVIDIA library is in the package. `libnvencvt` talks to the card through the RM interface of the open

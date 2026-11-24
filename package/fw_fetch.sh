@@ -8,7 +8,7 @@
 # Order of sources, first that works:
 #   1. --installed DIR (default /Library/NullMoth/nvfw): an earlier install whose four files all match the pins is reused,
 #      so an update or a re-install with no network changes nothing.
-#   2. --run FILE: a copy of NVIDIA-Linux-x86_64-620.70.06.run the user already downloaded (checked against its pin).
+#   2. --run FILE: a copy of NVIDIA-Linux-x86_64-620.73.04.run the user already downloaded (checked against its pin).
 #   3. a download of that .run from download.nvidia.com (about 550 MB; only the four firmware files are kept).
 #
 # Exit 0 and the line "FW_OK <dir>" when DIR holds all four verified files. Any other outcome exits 1 after printing why

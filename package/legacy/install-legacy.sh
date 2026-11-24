@@ -1,7 +1,7 @@
 #!/bin/bash
 # install-legacy.sh: install the NullMoth NVIDIA driver kit for one older macOS release (10.7 to 14). EXPERIMENTAL.
 #
-#     sudo sh install-legacy.sh [--run <NVIDIA-Linux-x86_64-620.70.06.run>] [--check]
+#     sudo sh install-legacy.sh [--run <NVIDIA-Linux-x86_64-620.73.04.run>] [--check]
 #
 # Each kit is built for exactly one release; this script refuses any other. It runs with the tools every release
 # since 10.7 has (bash 3.2, shasum, tar, kextcache or kmutil), so it needs no app.

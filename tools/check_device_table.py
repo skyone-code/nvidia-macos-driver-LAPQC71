@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """check_device_table.py <ogkm-README.md>: prove the installer's device table against NVIDIA's open-gpu-kernel-modules
-supported-GPU list (the README table of the same 620.70.06 tree the kernel side is built from).
+supported-GPU list (the README table of the same 620.73.04 tree the kernel side is built from).
 
 Arms (each prints PASS or FAIL):
   - every id the installer carries is in NVIDIA's list;
@@ -44,7 +44,7 @@ def main(argv):
     arm("NVIDIA's list was read (more than 250 ids)", len(nv) > 250, str(len(nv)))
     arm("the installer table is sorted and unique, 4 upper-case hex digits each",
         mine == sorted(set(mine)) and all(re.fullmatch(r"[0-9A-F]{4}", k) for k in mine))
-    arm("every installer id is in NVIDIA's 620.70.06 list", not [i for i in mine if i not in nv], str([i for i in mine if i not in nv]))
+    arm("every installer id is in NVIDIA's 620.73.04 list", not [i for i in mine if i not in nv], str([i for i in mine if i not in nv]))
     left = [(i, sorted(nv[i])) for i in sorted(nv) if i not in mine]
     wrong = [(i, n) for i, n in left if not all(HEADLESS.search(x) for x in n)]
     arm("every id left out is a headless data-centre / mining part (%d left out)" % len(left), not wrong, str(wrong))

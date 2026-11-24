@@ -1,6 +1,6 @@
 /*
  * The display engine's compiled 3D shaders (ampere, hopper, turing, blackwell, gb20x), xz-compressed and embedded as data.
- * They are the files src/nvidia-modeset/src/shaders/g_*_shaders of NVIDIA's open-gpu-kernel-modules 620.70.06,
+ * They are the files src/nvidia-modeset/src/shaders/g_*_shaders of NVIDIA's open-gpu-kernel-modules 620.73.04,
  * Copyright (c) NVIDIA CORPORATION & AFFILIATES, MIT licence (licenses/NVIDIA-open-gpu-kernel-modules-COPYING.txt),
  * compressed unchanged. NullMoth wrote only this embedding.
  * SPDX-License-Identifier: MIT

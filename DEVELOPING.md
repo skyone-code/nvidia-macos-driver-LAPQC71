@@ -21,7 +21,7 @@ to `main`; nothing lands without review. A small pull request with a clear test 
 | Metal plugin (`NVMTLDriver.bundle`) | `plugin/` | Xcode 16 |
 | Shader translator (`libnvmtl_translate.dylib`) | `translator/` | Rust (stable) |
 | Vulkan layer (NVK, as patches on Mesa) | `nvk/` | Meson, Ninja, Rust, Mesa at the commit in `nvk/MESA_BASE` |
-| Kernel drivers (NVRM, NVRMFB, NVAccel, NVRMAGDC and the smaller ones) | `kexts/` | Xcode 16, NVIDIA's `open-gpu-kernel-modules` at tag `620.70.06` |
+| Kernel drivers (NVRM, NVRMFB, NVAccel, NVRMAGDC and the smaller ones) | `kexts/` | Xcode 16, NVIDIA's `open-gpu-kernel-modules` at tag `620.73.04` |
 | OpenGL for older releases (experimental) | `gl/` | see `gl/README.md` |
 | DLSS support | `dlss/` | see `dlss/README.md` |
 | Installer, uninstaller and what goes in the package | `package/` | a shell |

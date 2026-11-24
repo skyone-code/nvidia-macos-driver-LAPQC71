@@ -2,7 +2,7 @@
 # build_nvrm.sh <src> <ogkm tree> <out>: NVRM.kext (macOS 15, x86_64) from kexts/NVRM, linked against the RM core and the
 # NVKMS archive that were built in the open-gpu-kernel-modules tree (see build_rm620.sh / build_kms620.sh).
 #   <src>   the kexts/NVRM directory of the tree being built
-#   <ogkm>  the built open-gpu-kernel-modules tree, e.g. .../rm620/ogkm-620.70.06
+#   <ogkm>  the built open-gpu-kernel-modules tree, e.g. .../rm620/ogkm-620.73.04
 #   <out>   a new directory; an existing one is replaced
 # KMS_ARCHIVE=<libnvkms.a> links a different NVKMS archive (default: the one in the tree).
 # Same style as accel_build.sh. Output: <out>/NVRM.kext, imports.txt and symbols.txt (before strip).
@@ -17,7 +17,7 @@ NV="$OGKM/src/nvidia"; KMS="$OGKM/src/nvidia-modeset"
 want=$(cd "$SRC/patches" && ls *.patch | LC_ALL=C sort | tr '\n' ' ')
 have=$(LC_ALL=C sort "$OGKM/.nm-patches" 2>/dev/null | tr '\n' ' ')
 [ "$want" = "$have" ] || { echo "STOP: $OGKM was built with patches [$have]; this revision has [$want]. Run build_rm620.sh and build_kms620.sh in a new work dir"; exit 2; }
-# NVRM_PRISTINE_OGKM=<pristine 620.70.06 tree>: the patch chain must still apply to it with --fuzz=0 before anything is built.
+# NVRM_PRISTINE_OGKM=<pristine 620.73.04 tree>: the patch chain must still apply to it with --fuzz=0 before anything is built.
 if [ -n "${NVRM_PRISTINE_OGKM:-}" ]; then
   bash "$HERE/../tools/test_patch_chain.sh" "$NVRM_PRISTINE_OGKM" > "$OUT/patch-chain.txt" 2>&1 || { echo "STOP: the kexts/NVRM/patches chain does not apply to $NVRM_PRISTINE_OGKM"; cat "$OUT/patch-chain.txt"; exit 1; }
 fi

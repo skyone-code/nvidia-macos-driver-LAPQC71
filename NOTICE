@@ -8,7 +8,7 @@ translator/  Based on metal2vulkan, Copyright (C) Anees Iqbal
              (translator/LICENSE, translator/COPYING). Modifications by NullMoth Systems
              are released under the same licence.
 
-kexts/       Builds against NVIDIA's open GPU kernel modules 620.70.06, MIT (with GPL-2.0 alternatives
+kexts/       Builds against NVIDIA's open GPU kernel modules 620.73.04, MIT (with GPL-2.0 alternatives
              where noted), https://github.com/NVIDIA/open-gpu-kernel-modules
              (licenses/NVIDIA-open-gpu-kernel-modules-COPYING.txt).
 
@@ -21,7 +21,7 @@ Vulkan loader  The Khronos Vulkan-Loader v1.4.367 (commit aa6dee8385afe4b2cc0152
              Vulkan-Headers v1.4.367 (commit 9fbc2a782ee3f8a4db64e7d991e23da75e893f44), Apache-2.0.
 
 GSP firmware gsp_tu10x.bin, gsp_ga10x.bin and the matching ucode images are not part of this package. The installer
-             (package/fw_fetch.sh) reads them, unmodified, from NVIDIA's own 620.70.06 Linux driver package downloaded
+             (package/fw_fetch.sh) reads them, unmodified, from NVIDIA's own 620.73.04 Linux driver package downloaded
              to the user's Mac and checks each against a pinned SHA-256. They stay under NVIDIA's licence
              (licenses/NVIDIA-firmware-LICENCE.txt is the text that applies to those files).
 

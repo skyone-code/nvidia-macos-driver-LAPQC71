@@ -34,7 +34,7 @@
 // volume and is not firmlinked. Same layout underneath, so only the prefix differs. See the
 // firmlink note in nv_get_firmware.
 #define NV_XNU_FW_ALT_DIR "/usr/share/nvfw/nvidia/620.73.04/"
-// The largest image we ship is the Ampere ucodes at 56 MB (620.70.06, measured); the cap only has to be generous.
+// The largest image we ship is the Ampere ucodes at 56 MB (620.73.04, measured); the cap only has to be generous.
 #define NV_XNU_FW_MAX_BYTES (256u * 1024u * 1024u)
 #define NV_FIRMWARE_FOR_NAME(name) NV_XNU_FW_DIR name ".bin"
 extern "C" {

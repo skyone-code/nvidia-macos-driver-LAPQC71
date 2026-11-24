@@ -29,7 +29,7 @@ NEEDS_INPUT = {
     "test_fcwarm.py": "needs a built libnvmtl_translate.dylib and a shader file (build step)",
     "test_gl_translation.py": "needs a built libnvmtl_translate.dylib (build step)",
     "test_resource_phi_fold.py": "needs a built libnvmtl_translate.dylib (build step)",
-    "test_patch_chain.sh": "needs a pristine NVIDIA open-gpu-kernel-modules 620.70.06 tree (build_nvrm.sh runs it)",
+    "test_patch_chain.sh": "needs a pristine NVIDIA open-gpu-kernel-modules 620.73.04 tree (build_nvrm.sh runs it)",
 }
 BUILD_LINE = re.compile(r"(?:^|[\s*/])(cc|c\+\+|clang|clang\+\+)\s+(.*?)\s+&&\s+\S+")
 TIMEOUT = 600

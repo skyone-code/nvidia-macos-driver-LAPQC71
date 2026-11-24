@@ -148,7 +148,7 @@ Nothing is sent; you can upload the file on the site yourself.
 
 ## 7. Building
 
-See the README, *Build from source*. The kexts need NVIDIA's `open-gpu-kernel-modules` at tag `620.70.06`; NVK needs
+See the README, *Build from source*. The kexts need NVIDIA's `open-gpu-kernel-modules` at tag `620.73.04`; NVK needs
 Mesa `90a959eb` (the mesa-26.3.0-rc3 tag; 2.8 and 2.8.1 used `17ca6174`) with, in order, `nvk/nvk-macos.patch`, `nvk/nvk-fixes-after-def16.patch`, `nvk/nvk-620-kernel.patch`,
 `nvk/nvk-recycle.patch`, `nvk/nvk-slab.patch`, `nvk/nvk-slabdef.patch`, `nvk/nvk-hubfix.patch`, `nvk/nvk-perf-boost-burst.patch`,
 `nvk/nvk-rated-tdp.patch`, `nvk/nvk-gps-maxpower.patch`, `nvk/nvk-metal-wsi.patch`, `nvk/nvk-card-select.patch`, `nvk/hwrt/ttu-nak.patch`, `nvk/hwrt/ttu-rq.patch`, `nvk/curves/curves.patch`, `nvk/hwrt/wide.patch` and `nvk/nvk-warnings.patch` (`patch -p1` from the Mesa root; the last two are the ray-query part for the RT cores, off unless `NVK_HWRT_QUERY=1`, see `docs/HWRT.md`; `nvk/hwrt/nvk_hwrt.h` and `nvk_hwrt_layout.h` are copied into `src/nouveau/vulkan` after them), then

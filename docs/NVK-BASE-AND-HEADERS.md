@@ -23,7 +23,7 @@ the same on a card. Default off until a Geekbench and compositor run on the targ
 ## NVRM headers
 
 NVK is compiled against the 610.57.04 open kernel module headers with the NVOS change in `nvk/ogkm-nvos-620.patch`; the
-kernel module is built from 620.70.06. `tools/nvk_header_abi.py` compares, between module versions, every struct and
+kernel module is built from 620.73.04. `tools/nvk_header_abi.py` compares, between module versions, every struct and
 constant in the 135 headers the NVRM backend preprocesses to, restricted to the 198 names the backend sources use.
 
 | compared with 620.70.06 | structs differing | structs missing | defines differing | defines missing |

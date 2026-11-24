@@ -145,7 +145,7 @@ kpath() {
 }
 ioreg -r -c IOPCIDevice -d 1 | grep -q '"vendor-id" = <de100000>' || die "no NVIDIA GPU found on PCI"
 # The driver runs the cards NVIDIA's GSP firmware supports (Turing and later). The same list the Windows builder uses
-# (open-gpu-kernel-modules 620.70.06: 615's list + 2BBD RTX PRO 5500 Blackwell, 2E13 RTX Spark N1X, and the two data-centre cards that carry
+# (open-gpu-kernel-modules 620.73.04: 615's list + 2BBD RTX PRO 5500 Blackwell, 2E13 RTX Spark N1X, and the two data-centre cards that carry
 # DisplayPort outputs, A40 2235 and L40 26B5; the datacenter
 # VR NVL72 3041 left out like the other datacenter parts). Installing it for an older card (GTX 10 and before)
 # would switch the firmware screen off and leave nothing to draw: those PCs run macOS in basic display instead.

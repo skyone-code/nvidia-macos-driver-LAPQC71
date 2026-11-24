@@ -1,5 +1,5 @@
 #!/bin/bash
-# test_patch_chain.sh <pristine open-gpu-kernel-modules 620.70.06 tree>: every patch in kexts/NVRM/patches applies with --fuzz=0, in order.
+# test_patch_chain.sh <pristine open-gpu-kernel-modules 620.73.04 tree>: every patch in kexts/NVRM/patches applies with --fuzz=0, in order.
 # The tree is copied first; the original is not touched. Patches name their files from the tree root (a/src/...) or from src/nvidia-modeset.
 set -u
 SRC=${1:?pristine tree}; HERE=$(cd "$(dirname "$0")/.." && pwd); P="$HERE/kexts/NVRM/patches"

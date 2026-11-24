@@ -152,7 +152,7 @@ sudo ./uninstall.sh && sudo shutdown -r now
 
 ## Build from source
 
-Requires Xcode 16, Rust (stable), Meson/Ninja, and NVIDIA's `open-gpu-kernel-modules` at tag `620.70.06`.
+Requires Xcode 16, Rust (stable), Meson/Ninja, and NVIDIA's `open-gpu-kernel-modules` at tag `620.73.04`.
 
 ```bash
 build/build_xlate.sh

@@ -5,7 +5,7 @@
 # object drew a linker note against NVRM's 15.0 target). Four headers learn NV_DARWIN; the patch chain is applied first.
 # Usage: build_rm620.sh <work dir> <pristine open-gpu-kernel-modules-<version> tree>; the work dir gets ogkm-<version>.
 set -uo pipefail
-B=$(cd "${1:?work dir}" && pwd); V=${NV_VERSION:-620.70.06}
+B=$(cd "${1:?work dir}" && pwd); V=${NV_VERSION:-620.73.04}
 SRC=${2:?pristine open-gpu-kernel-modules tree}
 T=$B/ogkm-$V
 JOBS=${JOBS:-6}

@@ -12,7 +12,7 @@ asked about, and writes conf settings only into the block the installer keeps ac
 
 | Item | State | Notes |
 |---|---|---|
-| Device table | 251 ids, `SUPPORTED_IDS` in `package/install.sh`, mirrored in the app's `nvidia_gsp_ids.json` | Proven against NVIDIA's 620.70.06 list by `tools/check_device_table.py <ogkm README.md> [app json]`: every id is in NVIDIA's list, every id left out (48) is a headless data-centre or mining part, every id falls in exactly one generation row, names match NVIDIA's. 2.9 added A40 (2235) and L40 (26B5), the two data-centre cards with DisplayPort outputs. |
+| Device table | 251 ids, `SUPPORTED_IDS` in `package/install.sh`, mirrored in the app's `nvidia_gsp_ids.json` | Proven against NVIDIA's 620.73.04 list by `tools/check_device_table.py <ogkm README.md> [app json]`: every id is in NVIDIA's list, every id left out (48) is a headless data-centre or mining part, every id falls in exactly one generation row, names match NVIDIA's. 2.9 added A40 (2235) and L40 (26B5), the two data-centre cards with DisplayPort outputs. |
 | Turing to Blackwell, desktop, laptop, Max-Q, workstation, T-series, MX with Turing | all present | GTX 16, RTX 20, RTX 30 (GA10x), RTX 40, RTX 50, RTX A, RTX Ada, RTX PRO Blackwell, Quadro RTX, T400 to T1200, MX450/MX550 (Turing), MX570 (GA107) |
 | Unknown future id | still installs | the installer accepts any device id from 1E00 up; only the name is missing from the Mac app until its list is updated |
 | Per-generation paths | one row per generation in `plugin/nvmtl_dlss.c` (DLSS architecture), SM targets in `plugin/NVMTLVendorCompiler.m`, video library choice in `docs/WINDOWS-PARITY-MEDIA.md` | the device-table check proves every id reaches exactly one generation row |

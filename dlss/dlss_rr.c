@@ -167,7 +167,7 @@ static int etbl_chip(void *d, int *c) { *c = g_chip; return 0; }
 static int etbl_none(void) { return 3; }
 static void *g_etbl[320];
 static int nv_etbl(const void **t, const void *uuid) { for (int i = 0; i < 320; i++) g_etbl[i] = (void *)etbl_none; g_etbl[257] = (void *)etbl_chip; *t = g_etbl; return 0; }
-static int nv_drv(char *b, unsigned n) { snprintf(b, n, "620.70.06"); return 0; }
+static int nv_drv(char *b, unsigned n) { snprintf(b, n, "620.73.04"); return 0; }
 static int nv_name(void *d, char *b, unsigned n) { snprintf(b, n, "NVIDIA GeForce RTX 5060"); return 0; }
 static int nv_pci(void *d, uint8_t *p) { memset(p, 0, 68); ((uint32_t *)(p + 16))[3] = (g_device << 16) | g_vendor; return 0; }
 static int nv_unsupported(void) { return 3; }

@@ -3,7 +3,7 @@
 # already carries every patch in kexts/NVRM/patches. Same transform as RM, for macOS 15.0.
 # Usage: build_kms620.sh <work dir> (the one build_rm620.sh filled).
 set -uo pipefail
-B=$(cd "${1:?work dir}" && pwd); JOBS=${JOBS:-6}; V=${NV_VERSION:-620.70.06}
+B=$(cd "${1:?work dir}" && pwd); JOBS=${JOBS:-6}; V=${NV_VERSION:-620.73.04}
 [ -f "$B/ogkm-$V/.nm-patches" ] || { echo "STOP: $B/ogkm-$V has no record of the patches applied to it; run build_rm620.sh in a new work dir"; exit 2; }
 cd "$B/ogkm-$V/src/nvidia-modeset" || exit 2
 O=_out/Darwin_x86_64; mkdir -p "$O"

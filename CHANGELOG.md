@@ -15,6 +15,11 @@ Vulkan side moves from Mesa 26.3.0-rc3 to the **mesa-26.3.1** tag, and the GSP/u
   and failed ESC commands — Vulkan enumerated no device until the firmware matched.
 - Mesa/NVK base 26.3.0-rc3 (90a959eb) → mesa-26.3.1 (fec8830e); the NVK patch chain applies unchanged.
 - `build_nvk.sh` grows a `3.1` release branch (same chain as 3.0).
+- The DLSS/NGX stack moves to the 620.73.04 package with the RM: `dlss_fetch.sh` pins the 620.73.04 .run and its
+  `libnvidia-ngx.so.620.73.04` core, the NVML stand-ins (`dlss_fg.c`, `dlss_rr.c`, `nvmtl_dlss.c`) report 620.73.04,
+  and the build defaults (`build_rm620.sh`, `build_kms620.sh`, `build_release_inputs.sh`) follow the 620.73.04 tree.
+  Upstream's 3.1 also merges in: the VFX translator fixes, the NAK late memory-access split (the `nvk-nak-late-split`
+  chain entry, verified against the mesa-26.3.1 base), and the boot-guard one-answer-per-boot fix.
 
 ### Fixes (from upstream 3.1)
 - The lock screen and login window crashing in a loop (SecurityAgent or loginwindow, "Floating point exception" in VFX, #624 #569): the user picture is drawn by VFX, and nine of its ray-tracing kernels could not be built, so VFX divided by the thread count of a pipeline that did not exist. The shader translator now follows a value a shader keeps in a local structure and reads back in a helper (VFX keeps its acceleration structure that way), and returns of textures and pointers from helpers. Every compute kernel in VFX now builds (312 of 312; 3.0 built 249 and refused 27), and eight VFX fragment shaders that were refused build too.

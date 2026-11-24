@@ -9,10 +9,10 @@
 # records it, and a tree with uncommitted changes is refused.
 #
 # Where the build Mac keeps what is not in this tree (set NULLMOTH_BUILD_ROOT, or each one):
-#   NM_OGKM620           NVIDIA open-gpu-kernel-modules 620.70.06 with the RM core and NVKMS archives built
-#                        (build_rm620.sh, build_kms620.sh)                   default $NULLMOTH_BUILD_ROOT/build/rm620/ogkm-620.70.06
+#   NM_OGKM620           NVIDIA open-gpu-kernel-modules 620.73.04 with the RM core and NVKMS archives built
+#                        (build_rm620.sh, build_kms620.sh)                   default $NULLMOTH_BUILD_ROOT/build/rm620/ogkm-620.73.04
 #   NM_OGKM620_PRISTINE  the same release, untouched (the patch chain is checked against it)
-#                                                                            default .../build/ogkm620/open-gpu-kernel-modules-620.70.06
+#                                                                            default .../build/ogkm620/open-gpu-kernel-modules-620.73.04
 #   NM_OGKM610           open-gpu-kernel-modules 610.57.04 (headers NVK is built against)
 #                                                                            default .../build/ogkm620/open-gpu-kernel-modules-610.57.04
 #   NM_MESA_GIT          a Mesa git clone holding nvk/MESA_BASE              default .../build/gpu-src/mesa
@@ -25,8 +25,8 @@ set -uo pipefail
 OUT=${1:?out dir}
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 R=${NULLMOTH_BUILD_ROOT:-}
-OGKM=${NM_OGKM620:-$R/build/rm620/ogkm-620.70.06}
-PRISTINE=${NM_OGKM620_PRISTINE:-$R/build/ogkm620/open-gpu-kernel-modules-620.70.06}
+OGKM=${NM_OGKM620:-$R/build/rm620/ogkm-620.73.04}
+PRISTINE=${NM_OGKM620_PRISTINE:-$R/build/ogkm620/open-gpu-kernel-modules-620.73.04}
 OGKM610=${NM_OGKM610:-$R/build/ogkm620/open-gpu-kernel-modules-610.57.04}
 MESA=${NM_MESA_GIT:-$R/build/gpu-src/mesa}
 STEPS=${STEPS:-nvrm fb accel agdc nmsmn nmkbl nmhda efizip airdis dlss nvk boost vulkan}

@@ -19,7 +19,7 @@ printf 'dlss runtime\n' > "$F/dlss.so"; printf 'dlssd runtime\n' > "$F/dlssd.so"
 # stand-in for NVIDIA's makeself .run: a shell header with skip=N, then a zstd-compressed tar (as the real one is)
 ZSTD=${ZSTD:-$(command -v zstd || echo /opt/homebrew/bin/zstd)}   # only the fixture needs the compressor; the script under test never does
 [ -x "$ZSTD" ] || { echo "test needs a zstd command (set ZSTD=) to build its fixture"; exit 2; }
-mkdir -p "$W/payload" && printf 'ngx core\n' > "$W/payload/libnvidia-ngx.so.620.70.06" && printf 'other\n' > "$W/payload/other.bin"
+NGX_NAME=$(sed -n "s/^NGX_MEMBER=//p" "$SCRIPT"); mkdir -p "$W/payload" && printf 'ngx core\n' > "$W/payload/$NGX_NAME" && printf 'other\n' > "$W/payload/other.bin"
 { printf '#!/bin/sh\n# makeself stand-in\nCRCsum=0\nskip=6\n'; printf 'exit 1\n'; tar -C "$W/payload" -cf - . | "$ZSTD" -q -c; } > "$F/driver.run"
 clang -O1 -DZSTD_DISABLE_ASM -o "$W/tools/nm_unzstd" "$ROOT/dlss/nm_unzstd.c" "$ROOT"/dlss/zstd/common/*.c "$ROOT"/dlss/zstd/decompress/*.c || { echo "cannot build nm_unzstd"; exit 2; }
 python3 -I - "$F" <<'PY'
@@ -54,7 +54,7 @@ run() { # run <pins> [args]: stdin is not a terminal
   local p=$1; shift
   DLSS_TEST_PINS=$p bash "$SCRIPT" "$@" </dev/null 2>&1
 }
-good() { [ $rc = 0 ] && [ -f "$R1/ngx/libnvidia-ngx.so.620.70.06" ] && [ -f "$R1/snippets/libnvidia-ngx-dlss.so.310.9.16" ] &&
+good() { [ $rc = 0 ] && [ -f "$R1/ngx/$NGX_NAME" ] && [ -f "$R1/snippets/libnvidia-ngx-dlss.so.310.9.16" ] &&
   [ -f "$R1/snippets/libnvidia-ngx-dlssd.so.310.9.16" ] && [ -f "$R1/snippets/libnvidia-ngx-dlssg.so.310.9.16" ] && [ -f "$R1/kernels/0123abcd.sm120.cubin" ] &&
   grep -q '^sm: 120$' "$R1/manifest.txt"; }
 perms() { [ "$(stat -f %Lp "$R1/kernels/0123abcd.sm120.cubin")" = 644 ] && [ -z "$(find "$R1" \( -perm -g+w -o -perm -o+w \) -print -quit)" ]; }
@@ -81,7 +81,7 @@ arm "NEGATIVE: a download with the wrong SHA-256 is refused and nothing is insta
 
 R3=$W/r3/dlss; mkpins "$W/p3" "$R3"; sed -i '' "s/^SHA_NGX=.*/SHA_NGX=$(shastr x)/" "$W/p3"
 out=$(run "$W/p3" --yes --sm 120); rc=$?
-badngx() { [ $rc != 0 ] && echo "$out" | grep -q 'libnvidia-ngx.so.620.70.06 does not match' && [ ! -e "$R3/manifest.txt" ]; }
+badngx() { [ $rc != 0 ] && echo "$out" | grep -q "$NGX_NAME does not match" && [ ! -e "$R3/manifest.txt" ]; }
 arm "NEGATIVE: a wrong file inside the NVIDIA package is refused" "$(t badngx)" "rc=$rc"
 
 R4=$W/r4/dlss; mkpins "$W/p4" "$R4"; sed -i '' "s/^SHA_JITLINK=.*/SHA_JITLINK=$(shastr x)/" "$W/p4"

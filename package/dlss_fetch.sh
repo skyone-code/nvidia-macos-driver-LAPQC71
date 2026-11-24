@@ -7,7 +7,7 @@
 #
 # (The frame-generation runtime is fetched alongside the other two.)
 # Result, all under /Library/NullMoth/dlss (root-owned, not writable by others):
-#   ngx/        NGX core               libnvidia-ngx.so.620.70.06
+#   ngx/        NGX core               libnvidia-ngx.so.620.73.04
 #   snippets/   DLSS runtimes          libnvidia-ngx-dlss.so.310.9.16, libnvidia-ngx-dlssd.so.310.9.16,
 #               libnvidia-ngx-dlssg.so.310.9.16
 #   kernels/    compiled GPU kernels   <BLAKE3 of the PTX object>.sm<N>.cubin
@@ -27,11 +27,12 @@ URL_DLSSD="$GH_RAW/libnvidia-ngx-dlssd.so.310.9.16"
 SHA_DLSSD=a5d59de18841f15779039dda567a15dd723ba737915f489271fdb5f109fbfb96
 URL_DLSSG="$GH_RAW/libnvidia-ngx-dlssg.so.310.9.16"
 SHA_DLSSG=574839cae01c835de4d5845c36ca9cf75361f8160bd52397142c36a24e29e6f7
-# NGX core: inside NVIDIA's Linux 620.70.06 driver package (about 550 MB; only one file is kept)
-URL_RUN="https://download.nvidia.com/XFree86/Linux-x86_64/620.70.06/NVIDIA-Linux-x86_64-620.70.06.run"
-SHA_RUN=29118e3abd08c07559bcca3d9c76238d039490af0362a2e5bcfcbe7204afd4b1
-NGX_MEMBER=libnvidia-ngx.so.620.70.06
-SHA_NGX=68ac7184bfc27f6b6fef1080a2054ae9919ef8c825421b4722d517c789e88942
+# NGX core: inside NVIDIA's Linux 620.73.04 driver package (about 550 MB; only one file is kept).
+# The package and SHA equal fw_fetch.sh's pin: one .run serves both the GPU firmware and the NGX core.
+URL_RUN="https://download.nvidia.com/XFree86/Linux-x86_64/620.73.04/NVIDIA-Linux-x86_64-620.73.04.run"
+SHA_RUN=b5f2e2d5da8435b32539304015b89bf7eb22fe0aec8cd6905b7a6e8a9f9b8f1b
+NGX_MEMBER=libnvidia-ngx.so.620.73.04
+SHA_NGX=e6178a8374b29dfd7c9e68abf572e6d122026561fcd6287bdf3967eee98524ad
 # nvJitLink 12.9.86: the PyPI wheel (manylinux x86_64), then the one library inside it
 URL_WHEEL="https://files.pythonhosted.org/packages/46/0c/c75bbfb967457a0b7670b8ad267bfc4fffdf341c074e0a80db06c24ccfd4/nvidia_nvjitlink_cu12-12.9.86-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl"
 SHA_WHEEL=e3f1171dbdc83c5932a45f0f4c99180a70de9bd2718c1ab77d14104f6d7147f9
@@ -105,7 +106,7 @@ fi
 # ---- opt in ----------------------------------------------------------------------------------------------------
 if [ "$YES" != 1 ]; then
   [ -t 0 ] || { echo "DLSS 4 / 4.5 is optional and was not requested (run: sudo ./dlss_fetch.sh --yes)."; exit 0; }
-  echo "DLSS 4 / 4.5 support downloads about 750 MB of NVIDIA files (DLSS SDK 310.9.16, NGX 620.70.06, nvJitLink 12.9.86)"
+  echo "DLSS 4 / 4.5 support downloads about 750 MB of NVIDIA files (DLSS SDK 310.9.16, NGX 620.73.04, nvJitLink 12.9.86)"
   echo "from NVIDIA's public sites and builds GPU kernels for this card (sm_$SM). The files stay under NVIDIA's licences."
   printf 'Download and install them? [y/N] '; read -r a
   case "$a" in y|Y|yes|YES) ;; *) echo "Skipped."; exit 0;; esac
@@ -192,7 +193,7 @@ tail -n 5 "$T/cache.log"
 n=$(find "$NEW/kernels" -name '*.cubin' | wc -l | tr -d ' ')
 {
   echo "dlss_fetch 1"
-  echo "dlss: 310.9.16"; echo "ngx: 620.70.06"; echo "nvjitlink: 12.9.86"
+  echo "dlss: 310.9.16"; echo "ngx: 620.73.04"; echo "nvjitlink: 12.9.86"
   echo "sm: $SM"; echo "kernels: $n"
   echo "pins: $WANT"
   echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
