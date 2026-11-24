@@ -6,3 +6,4 @@ __pycache__/
 
 # Cargo build output: never committed.
 translator/translator/target/
+.DS_Store
