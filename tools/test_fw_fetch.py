@@ -14,6 +14,8 @@ import tempfile
 from compression import zstd
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+VER = re.search(r"^VER=(.*)$", open(ROOT + "/package/fw_fetch.sh").read(), re.M).group(1)
+RUN_NAME = "NVIDIA-Linux-x86_64-%s.run" % VER
 fails = 0
 
 
@@ -89,13 +91,13 @@ with tempfile.TemporaryDirectory() as td:
     d = td + "/d1"; os.makedirs(d)
     r = run(pkg, env, "--dest", d, "--run", run_path, "--installed", td + "/none")
     check("a driver package that matches its pin yields four verified firmware files", r.returncode == 0 and "FW_OK" in r.stdout and
-          dest_files(d) == sorted(MEMBERS) and open(d + "/nvidia/620.70.06/gsp_tu10x.bin", "rb").read() == FILES["gsp_tu10x.bin"], r.stdout + r.stderr)
+          dest_files(d) == sorted(MEMBERS) and open(d + "/nvidia/%s/gsp_tu10x.bin" % VER, "rb").read() == FILES["gsp_tu10x.bin"], r.stdout + r.stderr)
 
     d = td + "/d2"; os.makedirs(d)
     r = run(pkg, env, "--dest", d, "--installed", td + "/none")
     check("with no file given the package is downloaded from the pinned URL and verified", r.returncode == 0 and dest_files(d) == sorted(MEMBERS), r.stdout + r.stderr)
 
-    inst = td + "/inst/nvidia/620.70.06"; os.makedirs(inst)
+    inst = td + "/inst/nvidia/" + VER; os.makedirs(inst)
     for m, b in FILES.items():
         open(inst + "/" + m, "wb").write(b)
     pins(td + "/dead.pins", run_sha, good, "file://" + td + "/does-not-exist")
@@ -131,12 +133,38 @@ with tempfile.TemporaryDirectory() as td:
     r = run(pkg, {"FW_TEST_PINS": td + "/short.pins"}, "--dest", d, "--run", td + "/short.run", "--installed", td + "/none")
     check("a driver package without one of the files is refused", r.returncode == 1 and dest_files(d) == [], r.stdout + r.stderr)
 
+    # a copy on a stick or in Downloads (the search list), found with no --run and no network; a wrong copy is skipped
+    stick = td + "/stick"; os.makedirs(stick + "/NullMoth")
+    subprocess.check_call(["cp", run_path, stick + "/NullMoth/" + RUN_NAME])
+    open(stick + "/" + RUN_NAME, "wb").write(b"half a download")
+    d = td + "/d8"; os.makedirs(d)
+    r = run(pkg, {"FW_TEST_PINS": td + "/deadgood.pins", "FW_TEST_SEARCH": stick}, "--dest", d, "--installed", td + "/none") \
+        if not pins(td + "/deadgood.pins", run_sha, good, "file://" + td + "/does-not-exist") else None
+    check("NVIDIA's file on a stick is found with no network, and a wrong copy beside it is skipped",
+          r.returncode == 0 and dest_files(d) == sorted(MEMBERS) and "does not match the pin" in r.stdout, r.stdout + r.stderr)
+
+    # a download that stops is continued, not restarted
+    half = td + "/half.run"
+    d = td + "/d9"; os.makedirs(d)
+    r = run(pkg, env, "--dest", d, "--installed", td + "/none")
+    check("the download is resumable (curl -C -) and retried", "-C -" in open(pkg + "/fw_fetch.sh").read() and r.returncode == 0,
+          r.stdout + r.stderr)
+
 # the real pins
 fw = open(ROOT + "/package/fw_fetch.sh").read()
 dl = open(ROOT + "/package/dlss_fetch.sh").read()
 g = lambda s, k: re.search(r"^%s=(.*)$" % k, s, re.M).group(1)
-check("the driver package URL and SHA-256 equal the ones dlss_fetch.sh pins", g(fw, "SHA_RUN") == g(dl, "SHA_RUN") and "NVIDIA-Linux-x86_64-620.70.06.run" in dl and
-      "XFree86/Linux-x86_64/$VER/NVIDIA-Linux-x86_64-$VER.run" in fw and "XFree86/Linux-x86_64/620.70.06/NVIDIA-Linux-x86_64-620.70.06.run" in dl)
+dl_ver = re.search(r"Linux-x86_64/(\S+)/NVIDIA", dl).group(1)
+if dl_ver == VER:
+    check("the driver package URL and SHA-256 equal the ones dlss_fetch.sh pins", g(fw, "SHA_RUN") == g(dl, "SHA_RUN") and RUN_NAME in dl and
+          "XFree86/Linux-x86_64/$VER/NVIDIA-Linux-x86_64-$VER.run" in fw and ("XFree86/Linux-x86_64/%s/%s" % (VER, RUN_NAME)) in dl)
+else:
+    # fork: the GSP firmware follows the RM base (%s), while the DLSS/NGX stack is deliberately pinned to its own
+    # driver package (%s): dlss_fg.c/dlss_rr.c build NGX paths from nv_drv() = %s, and that pairing is what shipped.
+    # Each script must then at least be internally consistent about the version it names.
+    check("dlss_fetch.sh pins its own driver package consistently (NGX on %s; GSP firmware on %s)" % (dl_ver, VER),
+          ("NVIDIA-Linux-x86_64-%s.run" % dl_ver) in dl and ("libnvidia-ngx.so.%s" % dl_ver) in dl and
+          "XFree86/Linux-x86_64/$VER/NVIDIA-Linux-x86_64-$VER.run" in fw)
 check("every firmware member the installer needs has a 64-hex pin",
       all(re.search(r"%s\)\s+echo [0-9a-f]{64};;" % re.escape(m), fw) for m in MEMBERS))
 inst = open(ROOT + "/package/install.sh").read()
