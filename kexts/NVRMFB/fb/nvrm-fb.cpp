@@ -2605,18 +2605,30 @@ bool NVRMNVDAFramebuffer::activateStandby()
     if (fIndex >= (unsigned)gNDpy) return false;
     const auto &sink = gDpy[fIndex];
     if (!sink.connected) return false;
-    const NvU32 available = sink.headMask & ~gHeadsTaken;
     NvKmsKapiDisplayMode mode = {};
-    if (!available || !selectInitialMode(sink.handle, fMemBytes, fPitchAlign, mode)) {
-        FBLOG("fb%u: standby has no compatible head or scanout mode", fIndex);
+    if (!selectInitialMode(sink.handle, fMemBytes, fPitchAlign, mode)) {
+        FBLOG("fb%u: standby has no compatible scanout mode", fIndex);
         return false;
     }
-
-    fHead = (NvU32)__builtin_ctz(available);
-    gHeadsTaken |= 1u << fHead;
-    fOwnsHead = true;
-    fDisplay = sink.handle;
-    fConnector = sink.connector;
+    if (fOwnsHead && fDisplay == sink.handle && (sink.headMask & (1u << fHead))) {
+        // The device rebuild's re-enumeration bound this very display to fHead (the normal
+        // enumeration branch runs once gNDpy covers this index) -- keep that binding. Picking
+        // again from headMask & ~gHeadsTaken would skip to a head the enumeration never bound
+        // to the display: NVKMS accepts its flips but never latches them (the screen keeps the
+        // black frame, vblank refused), which is exactly what the rebuild was meant to fix.
+        FBLOG("fb%u: standby keeps the enumerated binding: display 0x%x on head %u", fIndex, fDisplay, fHead);
+    } else {
+        const NvU32 available = sink.headMask & ~gHeadsTaken;
+        if (!available) {
+            FBLOG("fb%u: standby has no free head (taken 0x%x)", fIndex, (unsigned)gHeadsTaken);
+            return false;
+        }
+        fHead = (NvU32)__builtin_ctz(available);
+        gHeadsTaken |= 1u << fHead;
+        fOwnsHead = true;
+        fDisplay = sink.handle;
+        fConnector = sink.connector;
+    }
     const IOReturn result = switchMode(kModeId, mode, mode.timings.hVisible, mode.timings.vVisible, 0);
     if (result != kIOReturnSuccess) {
         // A rejected transaction hasn't bound the head. An accepted
